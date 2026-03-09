@@ -1,0 +1,45 @@
+[[corpus]]
+name = "pure_fortran_examples"
+path = "c:/python/public_domain/github/Pure-Fortran-Examples"
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "mixtures/xsim_mix_mv.py"
+tags = ["smoke", "python", "matrix"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "python_numpy_examples_1/t004_reshape_ravel_flatten.py"
+tags = ["smoke", "python", "arrays"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "python_numpy_examples_1/t007_basic_slicing_2d.py"
+tags = ["python", "slicing", "regression"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "option_pricing/xbs.py"
+tags = ["python", "option_pricing", "closed_form"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "option_pricing/xbs_monte_carlo.py"
+tags = ["python", "option_pricing", "monte_carlo"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "option_pricing/xamerican_options.py"
+tags = ["python", "option_pricing", "tree"]
+
+[[case]]
+corpus = "pure_fortran_examples"
+language = "python"
+path = "option_pricing/xoptions_pde.py"
+tags = ["python", "option_pricing", "pde"]

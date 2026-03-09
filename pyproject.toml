@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "array-compiler"
+version = "0.1.0"
+description = "Compiler/transpiler framework for array-oriented scientific code"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["array_compiler*"]
