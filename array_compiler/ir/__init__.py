@@ -1,6 +1,8 @@
 from .module import Module
 from .nodes import (
     Assignment,
+    Append,
+    ArrayTypeRef,
     AugmentedAssignment,
     BinaryOp,
     BinaryOperator,
@@ -14,6 +16,7 @@ from .nodes import (
     FieldAssignment,
     ForRange,
     Function,
+    IndexAccess,
     If,
     Print,
     Program,
@@ -31,6 +34,8 @@ from .nodes import (
 
 __all__ = [
     "Assignment",
+    "Append",
+    "ArrayTypeRef",
     "AugmentedAssignment",
     "BinaryOp",
     "BinaryOperator",
@@ -44,6 +49,7 @@ __all__ = [
     "FieldAssignment",
     "ForRange",
     "Function",
+    "IndexAccess",
     "If",
     "Module",
     "Print",

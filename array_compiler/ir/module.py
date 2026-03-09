@@ -13,3 +13,6 @@ class Module:
     records: list[RecordDef] = field(default_factory=list)
     functions: list[Function] = field(default_factory=list)
     program: Program | None = None
+    exports: list[str] = field(default_factory=list)
+    library_mode: bool = True
+    diagnostics: list[str] = field(default_factory=list)

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from ...ir.module import Module
 from ...ir.nodes import (
     Assignment,
+    Append,
+    ArrayTypeRef,
     AugmentedAssignment,
     BinaryOp,
     BinaryOperator,
@@ -25,6 +27,7 @@ from ...ir.nodes import (
     ForRange,
     Function,
     If,
+    IndexAccess,
     Print,
     Program,
     Raise,
@@ -62,7 +65,15 @@ class PythonNumpyFrontend:
                 functions.append(self._lower_function(node))
             elif self._is_main_guard(node):
                 program = self._lower_main_guard(node)
-        return Module(name=module_name, records=list(self._record_defs.values()), functions=functions, program=program)
+        exports = [fn.name for fn in functions]
+        return Module(
+            name=module_name,
+            records=list(self._record_defs.values()),
+            functions=functions,
+            program=program,
+            exports=exports,
+            library_mode=True,
+        )
 
     def _register_function_signature(self, node: ast.FunctionDef) -> None:
         result_type = self._map_annotation(node.returns, node.name)
@@ -109,7 +120,7 @@ class PythonNumpyFrontend:
         elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
             locals_map.setdefault(stmt.target.id, self._infer_type(stmt.value))
         elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
-            locals_map.setdefault(stmt.target.id, ScalarType.INTEGER)
+            locals_map.setdefault(self._loop_target_name(stmt.target.id), ScalarType.INTEGER)
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
             for inner in stmt.orelse:
@@ -152,11 +163,24 @@ class PythonNumpyFrontend:
                 raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
             if not isinstance(stmt.iter, ast.Call) or not isinstance(stmt.iter.func, ast.Name) or stmt.iter.func.id != "range":
                 raise NotImplementedError(f"unsupported loop iterator: {ast.dump(stmt.iter)}")
-            if len(stmt.iter.args) != 1:
-                raise NotImplementedError("only range(stop) is supported in the first loop slice")
+            if len(stmt.iter.args) not in {1, 2, 3}:
+                raise NotImplementedError("range supports up to three arguments in the current Python frontend slice")
+            start = None
+            step = None
+            if len(stmt.iter.args) == 1:
+                stop = self._lower_expr(stmt.iter.args[0])
+            elif len(stmt.iter.args) == 2:
+                start = self._lower_expr(stmt.iter.args[0])
+                stop = self._lower_expr(stmt.iter.args[1])
+            else:
+                start = self._lower_expr(stmt.iter.args[0])
+                stop = self._lower_expr(stmt.iter.args[1])
+                step = self._lower_expr(stmt.iter.args[2])
             return ForRange(
-                target=stmt.target.id,
-                stop=self._lower_expr(stmt.iter.args[0]),
+                target=self._loop_target_name(stmt.target.id),
+                start=start,
+                stop=stop,
+                step=step,
                 body=tuple(self._lower_stmt(inner) for inner in stmt.body),
             )
         if isinstance(stmt, ast.Raise):
@@ -167,6 +191,13 @@ class PythonNumpyFrontend:
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             if isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print":
                 return Print(self._lower_print_args(stmt.value.args))
+            if (
+                isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "append"
+                and isinstance(stmt.value.func.value, ast.Name)
+                and len(stmt.value.args) == 1
+            ):
+                return Append(ValueRef(stmt.value.func.value.id), self._lower_expr(stmt.value.args[0]))
             return ExprStatement(self._lower_expr(stmt.value))
         raise NotImplementedError(f"unsupported statement: {ast.dump(stmt)}")
 
@@ -210,6 +241,8 @@ class PythonNumpyFrontend:
             return Constant(expr.value)
         if isinstance(expr, ast.Name):
             return ValueRef(expr.id)
+        if isinstance(expr, ast.List):
+            return Call("ac_array_literal", tuple(self._lower_expr(elt) for elt in expr.elts))
         if isinstance(expr, ast.Dict):
             record_type = self._function_result_types.get(self._current_function or "")
             if not isinstance(record_type, RecordTypeRef):
@@ -234,7 +267,7 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Subscript):
             if isinstance(expr.slice, ast.Constant) and isinstance(expr.slice.value, str):
                 return FieldAccess(self._lower_expr(expr.value), expr.slice.value)
-            raise NotImplementedError(f"unsupported subscript: {ast.dump(expr)}")
+            return IndexAccess(self._lower_expr(expr.value), self._lower_expr(expr.slice))
         if isinstance(expr, ast.BinOp):
             op_map = {
                 ast.Add: BinaryOperator.ADD,
@@ -252,8 +285,6 @@ class PythonNumpyFrontend:
             }
             return UnaryOp(op_map[type(expr.op)], self._lower_expr(expr.operand))
         if isinstance(expr, ast.Compare):
-            if len(expr.ops) != 1 or len(expr.comparators) != 1:
-                raise NotImplementedError("only simple comparisons are supported in the first Python frontend slice")
             op_map = {
                 ast.Eq: CompareOperator.EQ,
                 ast.NotEq: CompareOperator.NE,
@@ -262,6 +293,19 @@ class PythonNumpyFrontend:
                 ast.Gt: CompareOperator.GT,
                 ast.GtE: CompareOperator.GE,
             }
+            if len(expr.ops) > 1:
+                left = expr.left
+                comparisons: list[object] = []
+                for op, comparator in zip(expr.ops, expr.comparators, strict=True):
+                    if isinstance(op, ast.NotIn) and isinstance(comparator, ast.Set):
+                        comparisons.extend(
+                            Compare(self._lower_expr(left), CompareOperator.NE, self._lower_expr(elt))
+                            for elt in comparator.elts
+                        )
+                    else:
+                        comparisons.append(Compare(self._lower_expr(left), op_map[type(op)], self._lower_expr(comparator)))
+                    left = comparator
+                return BooleanOp("and", tuple(comparisons))
             op = expr.ops[0]
             if isinstance(op, ast.NotIn) and isinstance(expr.comparators[0], ast.Set):
                 terms = [
@@ -276,8 +320,8 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Name):
                 if expr.func.id in {"abs", "max", "min"}:
-                    return Call(expr.func.id, tuple(self._lower_expr(arg) for arg in expr.args))
-                return Call(expr.func.id, tuple(self._lower_expr(arg) for arg in expr.args))
+                    return Call(expr.func.id, self._lower_call_args(expr))
+                return Call(expr.func.id, self._lower_call_args(expr))
             if isinstance(expr.func, ast.Attribute):
                 if self._is_strip_lower_chain(expr.func):
                     base = self._lower_expr(expr.func.value.func.value)
@@ -287,15 +331,19 @@ class PythonNumpyFrontend:
                     return Call("trim", (Call("adjustl", (base,)),))
                 if expr.func.attr == "gauss":
                     base = self._lower_expr(expr.func.value)
-                    return Call("ac_gauss", (base, *tuple(self._lower_expr(arg) for arg in expr.args)))
+                    return Call("ac_gauss", (base, *self._lower_call_args(expr)))
                 chain = self._attr_chain(expr.func)
                 if chain == ["random", "Random"]:
-                    self._ensure_record("ac_random_state", [])
-                    return Call("ac_random_init", tuple(self._lower_expr(arg) for arg in expr.args))
+                    return Call("ac_random_init", self._lower_call_args(expr))
                 if chain[:1] == ["math"]:
-                    return Call(chain[1], tuple(self._lower_expr(arg) for arg in expr.args))
+                    return Call(chain[1], self._lower_call_args(expr))
             raise NotImplementedError(f"unsupported call: {ast.dump(expr)}")
         raise NotImplementedError(f"unsupported expression: {ast.dump(expr)}")
+
+    def _lower_call_args(self, expr: ast.Call) -> tuple[object, ...]:
+        values = [self._lower_expr(arg) for arg in expr.args]
+        values.extend(self._lower_expr(keyword.value) for keyword in expr.keywords)
+        return tuple(values)
 
     def _infer_type(self, expr: ast.AST) -> object:
         if isinstance(expr, ast.Constant):
@@ -309,6 +357,8 @@ class PythonNumpyFrontend:
                 return ScalarType.STRING
         if isinstance(expr, (ast.Compare, ast.BoolOp)):
             return ScalarType.LOGICAL
+        if isinstance(expr, ast.List):
+            return ArrayTypeRef(ScalarType.REAL64)
         if isinstance(expr, ast.Subscript):
             return ScalarType.REAL64
         if isinstance(expr, ast.Dict):
@@ -325,7 +375,6 @@ class PythonNumpyFrontend:
             if isinstance(expr.func, ast.Attribute):
                 chain = self._attr_chain(expr.func)
                 if chain == ["random", "Random"]:
-                    self._ensure_record("ac_random_state", [])
                     return RecordTypeRef("ac_random_state")
                 if chain[:1] == ["math"]:
                     return ScalarType.REAL64
@@ -386,6 +435,11 @@ class PythonNumpyFrontend:
 
     def _tuple_temp_name(self, function_name: str) -> str:
         return f"{function_name}_value"
+
+    def _loop_target_name(self, name: str) -> str:
+        if name == "_":
+            return "ac_loop_index"
+        return name
 
     def _is_docstring(self, stmt: ast.stmt) -> bool:
         return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)

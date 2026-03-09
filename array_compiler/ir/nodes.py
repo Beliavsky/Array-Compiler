@@ -23,6 +23,12 @@ class RecordTypeRef:
     name: str
 
 
+@dataclass(frozen=True)
+class ArrayTypeRef:
+    element_type: object
+    rank: int = 1
+
+
 class BinaryOperator(str, Enum):
     ADD = "+"
     SUB = "-"
@@ -66,6 +72,12 @@ class Call:
 class FieldAccess:
     value: object
     field: str
+
+
+@dataclass(frozen=True)
+class IndexAccess:
+    value: object
+    index: object
 
 
 @dataclass(frozen=True)
@@ -127,6 +139,12 @@ class AugmentedAssignment:
 
 
 @dataclass(frozen=True)
+class Append:
+    target: ValueRef
+    value: object
+
+
+@dataclass(frozen=True)
 class Return:
     value: object | None = None
 
@@ -158,6 +176,8 @@ class ForRange:
     target: str
     stop: object
     body: tuple[object, ...]
+    start: object | None = None
+    step: object | None = None
 
 
 @dataclass
