@@ -23,6 +23,7 @@ class HelperRegistry:
         self._helpers: dict[str, HelperModule] = {
             "kind_mod": HelperModule("kind_mod", "kind.f90", "Shared kind parameters for generated Fortran"),
             "ac_random": HelperModule("ac_random", "ac_random.f90", "Small RNG helper runtime for translated scalar Monte Carlo code"),
+            "ac_numpy": HelperModule("ac_numpy", "ac_numpy.f90", "Small NumPy-style runtime helpers for generated Fortran"),
             "lapack_d": HelperModule("lapack_d", "lapack_d.f90", "LAPACK and dense linear algebra helpers"),
             "python": HelperModule("python", "python.f90", "Python/NumPy compatibility helpers"),
             "octave_funcs": HelperModule("octave_funcs", "octave_funcs.f90", "Octave/Matlab compatibility helpers"),

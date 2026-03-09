@@ -28,6 +28,12 @@ def test_xbs_lowers_and_emits_fortran() -> None:
     assert "call run_example()" in source
 
 
+def test_python_frontend_accepts_utf8_bom_prefixed_source() -> None:
+    source = "\ufeffdef f(x: float) -> float:\n    return x\n"
+    module = PythonNumpyFrontend().lower_source(source, module_name="bom_mod")
+    assert [fn.name for fn in module.functions] == ["f"]
+
+
 def test_xbs_python_and_generated_fortran_outputs_agree() -> None:
     module = PythonNumpyFrontend().lower_source(XBS_PATH.read_text(), module_name="xbs_mod")
     source = FortranBackend().emit(module)

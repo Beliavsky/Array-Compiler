@@ -166,6 +166,16 @@ class Append:
 
 
 @dataclass(frozen=True)
+class Continue:
+    pass
+
+
+@dataclass(frozen=True)
+class Pass:
+    pass
+
+
+@dataclass(frozen=True)
 class Return:
     value: object | None = None
 
@@ -219,4 +229,5 @@ class RecordDef:
 @dataclass
 class Program:
     name: str
+    locals: list[tuple[str, object]] = field(default_factory=list)
     body: list[object] = field(default_factory=list)

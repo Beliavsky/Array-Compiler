@@ -18,6 +18,7 @@ from ...ir.nodes import (
     Compare,
     CompareOperator,
     Constant,
+    Continue,
     ExprStatement,
     FieldAccess,
     FieldAssignment,
@@ -27,6 +28,7 @@ from ...ir.nodes import (
     IndexAssignment,
     IndexAccess,
     ListComprehension,
+    Pass,
     Print,
     Raise,
     RecordLiteral,
@@ -39,6 +41,43 @@ from ...ir.nodes import (
 )
 from .formatter import wrap_fortran_source
 from .helpers import HelperRegistry
+
+AC_NUMPY_FUNCS = {
+    "ac_array",
+    "ac_asarray",
+    "ac_ndim",
+    "ac_shape_dim",
+    "ac_empty",
+    "ac_empty2",
+    "ac_choice_weighted",
+    "ac_choice_no_replace",
+    "ac_where",
+    "ac_row",
+    "ac_take_rows",
+    "ac_set_row",
+    "ac_set_rows",
+    "ac_reshape",
+    "ac_multivariate_normal",
+    "ac_savetxt",
+    "ac_loadtxt",
+    "ac_cov_rowvar_false",
+    "ac_slogdet",
+    "ac_inv",
+    "ac_einsum_ni_ij_nj_to_n",
+    "ac_matmul",
+    "ac_transpose",
+    "ac_atleast_2d",
+    "ac_sum_axis",
+    "ac_max_axis",
+    "ac_argsort",
+    "ac_column",
+    "ac_add_axis",
+    "ac_set_column",
+    "ac_full",
+    "ac_copy",
+    "ac_sub_col",
+    "ac_mul_col",
+}
 
 
 @dataclass
@@ -78,6 +117,8 @@ class FortranBackend:
         lines: list[str] = ["use kind_mod, only: dp"]
         if "ac_random" in helper_keys:
             lines.append("use ac_random_support, only: ac_random_state, ac_random_init, ac_gauss")
+        if "ac_numpy" in helper_keys:
+            lines.append("use ac_numpy_mod")
         return lines
 
     def _emit_visibility_lines(self, module: Module, export_names: list[str]) -> list[str]:
@@ -147,6 +188,8 @@ class FortranBackend:
 
     def _emit_program(self, program) -> list[str]:
         lines = [f"subroutine {program.name}()", "implicit none"]
+        for name, typ in getattr(program, "locals", []):
+            lines.append(self._declare_local(name, typ))
         for stmt in program.body:
             lines.extend(self._emit_stmt(stmt, result_name=""))
         lines.append(f"end subroutine {program.name}")
@@ -173,6 +216,10 @@ class FortranBackend:
             return ["return"]
         if isinstance(stmt, Raise):
             return [f'error stop {self._emit_string(stmt.message)}']
+        if isinstance(stmt, Continue):
+            return ["cycle"]
+        if isinstance(stmt, Pass):
+            return []
         if isinstance(stmt, Print):
             if not stmt.values:
                 return ["print *"]
@@ -223,11 +270,19 @@ class FortranBackend:
             if isinstance(expr.value, bool):
                 return ".true." if expr.value else ".false."
             if isinstance(expr.value, float):
+                if expr.value == float("inf"):
+                    return "huge(0.0_dp)"
+                if expr.value == float("-inf"):
+                    return "(-huge(0.0_dp))"
                 return self._emit_real(expr.value)
             return str(expr.value)
         if isinstance(expr, Call):
             if expr.func == "ac_array_literal":
                 return self._emit_array_literal(expr.args, "")
+            if expr.func == "ac_array" and len(expr.args) == 1 and self._is_nested_array_literal(expr.args[0]):
+                return f"ac_array({self._emit_nested_array(expr.args[0])})"
+            if expr.func == "float":
+                return f"ac_float({self._emit_expr(expr.args[0])})"
             if expr.func == "ac_repeat":
                 return f"spread({self._emit_expr(expr.args[0])}, 1, {self._emit_expr(expr.args[1])})"
             if expr.func == "ac_concat":
@@ -263,22 +318,28 @@ class FortranBackend:
 
     def _declare_arg(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
-            return f"{self._type_name(value_type.element_type)}, intent(in) :: {name}(:)"
+            dims = self._array_dims(value_type.rank)
+            return f"{self._type_name(value_type.element_type)}, intent(in) :: {name}{dims}"
         if value_type == ScalarType.STRING:
             return f"character(len=*), intent(in) :: {name}"
         return f"{self._type_name(value_type)}, intent(in) :: {name}"
 
     def _declare_local(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
-            return f"{self._type_name(value_type)} , allocatable :: {name}(:)"
+            dims = self._array_dims(value_type.rank)
+            return f"{self._type_name(value_type)} , allocatable :: {name}{dims}"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _declare_result(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
-            return f"{self._type_name(value_type.element_type)}, allocatable :: {name}(:)"
+            dims = self._array_dims(value_type.rank)
+            return f"{self._type_name(value_type.element_type)}, allocatable :: {name}{dims}"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _declare_component(self, name: str, value_type: object) -> str:
+        if isinstance(value_type, ArrayTypeRef):
+            dims = self._array_dims(value_type.rank)
+            return f"{self._type_name(value_type.element_type)}, allocatable :: {name}{dims}"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _emit_string(self, value: str) -> str:
@@ -304,10 +365,30 @@ class FortranBackend:
         }
         return mapping[value_type]
 
+    def _array_dims(self, rank: int) -> str:
+        return "(" + ", ".join(":" for _ in range(rank)) + ")"
+
     def _emit_array_literal(self, values: tuple[object, ...], target_name: str) -> str:
         if not values:
             return "[real(dp) :: ]"
         return "[" + ", ".join(self._emit_expr(value) for value in values) + "]"
+
+    def _is_nested_array_literal(self, expr: object) -> bool:
+        return (
+            isinstance(expr, Call)
+            and expr.func == "ac_array_literal"
+            and expr.args
+            and all(isinstance(arg, Call) and arg.func == "ac_array_literal" for arg in expr.args)
+        )
+
+    def _emit_nested_array(self, expr: object) -> str:
+        rows = len(expr.args)
+        cols = len(expr.args[0].args)
+        flat_values: list[str] = []
+        for col in range(cols):
+            for row in expr.args:
+                flat_values.append(self._emit_expr(row.args[col]))
+        return f"reshape([{', '.join(flat_values)}], [{rows}, {cols}])"
 
     def _emit_list_comp(self, expr: ListComprehension) -> str:
         if isinstance(expr.iterable, Call) and expr.iterable.func == "range":
@@ -356,6 +437,8 @@ class FortranBackend:
         def visit(value: object) -> None:
             if isinstance(value, Call) and value.func in {"ac_random_init", "ac_gauss"}:
                 helper_keys.add("ac_random")
+            elif isinstance(value, Call) and value.func in AC_NUMPY_FUNCS:
+                helper_keys.add("ac_numpy")
             elif isinstance(value, RecordTypeRef) and value.name == "ac_random_state":
                 helper_keys.add("ac_random")
 
