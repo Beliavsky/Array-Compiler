@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from ...ir.module import Module
 from ...ir.nodes import Function, RecordTypeRef, ScalarType
+from .formatter import wrap_fortran_source
 
 
 @dataclass
@@ -56,7 +57,7 @@ class FortranBindCGenerator:
         wrapper_lines.append("")
 
         return BindCArtifact(
-            source="\n".join(wrapper_lines),
+            source=wrap_fortran_source("\n".join(wrapper_lines), max_len=132),
             exported_wrappers=exported_wrappers,
             skipped_exports=skipped_exports,
             diagnostics=diagnostics,

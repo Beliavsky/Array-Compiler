@@ -19,6 +19,7 @@ from ...ir.nodes import (
     BinaryOperator,
     BooleanOp,
     Call,
+    ConditionalExpr,
     Compare,
     CompareOperator,
     Constant,
@@ -27,7 +28,9 @@ from ...ir.nodes import (
     ForRange,
     Function,
     If,
+    IndexAssignment,
     IndexAccess,
+    ListComprehension,
     Print,
     Program,
     Raise,
@@ -45,14 +48,18 @@ from ...ir.nodes import (
 @dataclass
 class PythonNumpyFrontend:
     _function_result_types: dict[str, object] = field(default_factory=dict, init=False)
+    _function_arg_defaults: dict[str, list[object | None]] = field(default_factory=dict, init=False)
     _record_defs: dict[str, RecordDef] = field(default_factory=dict, init=False)
     _current_function: str | None = field(default=None, init=False)
+    _current_symbols: dict[str, object] = field(default_factory=dict, init=False)
 
     def lower_source(self, source: str, module_name: str = "translated_module") -> Module:
         tree = ast.parse(source)
         self._function_result_types = {}
+        self._function_arg_defaults = {}
         self._record_defs = {}
         self._current_function = None
+        self._current_symbols = {}
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -79,15 +86,23 @@ class PythonNumpyFrontend:
         result_type = self._map_annotation(node.returns, node.name)
         if result_type is not None:
             self._function_result_types[node.name] = result_type
+        defaults: list[object | None] = [None] * len(node.args.args)
+        if node.args.defaults:
+            offset = len(node.args.args) - len(node.args.defaults)
+            for idx, default in enumerate(node.args.defaults, start=offset):
+                defaults[idx] = self._lower_expr(default)
+        self._function_arg_defaults[node.name] = defaults
 
     def _lower_function(self, node: ast.FunctionDef) -> Function:
         self._current_function = node.name
         locals_map: dict[str, object] = {}
+        args = [(arg.arg, self._map_annotation(arg.annotation, node.name) or ScalarType.REAL64) for arg in node.args.args]
+        self._current_symbols = {name: typ for name, typ in args}
         for stmt in node.body:
             self._collect_locals(stmt, locals_map)
-        args = [(arg.arg, self._map_annotation(arg.annotation, node.name) or ScalarType.REAL64) for arg in node.args.args]
         arg_names = {name for name, _ in args}
         locals_list = [(name, typ) for name, typ in locals_map.items() if name not in arg_names]
+        self._current_symbols.update(locals_list)
         body = [self._lower_stmt(stmt) for stmt in node.body if not self._is_docstring(stmt)]
         function = Function(
             name=node.name,
@@ -97,6 +112,7 @@ class PythonNumpyFrontend:
             result_type=self._function_result_types.get(node.name),
         )
         self._current_function = None
+        self._current_symbols = {}
         return function
 
     def _lower_main_guard(self, node: ast.If) -> Program:
@@ -106,9 +122,11 @@ class PythonNumpyFrontend:
     def _collect_locals(self, stmt: ast.stmt, locals_map: dict[str, object]) -> None:
         if isinstance(stmt, ast.Assign):
             inferred = self._infer_type(stmt.value)
+            self._collect_expr_locals(stmt.value, locals_map)
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
                     locals_map.setdefault(target.id, inferred)
+                    self._current_symbols.setdefault(target.id, inferred)
                 elif isinstance(target, ast.Tuple):
                     if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name):
                         record_type = self._function_result_types.get(stmt.value.func.id)
@@ -117,19 +135,43 @@ class PythonNumpyFrontend:
                     for index, elt in enumerate(target.elts, start=1):
                         if isinstance(elt, ast.Name):
                             locals_map.setdefault(elt.id, self._tuple_item_type(inferred, index))
+                            self._current_symbols.setdefault(elt.id, self._tuple_item_type(inferred, index))
         elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            self._collect_expr_locals(stmt.value, locals_map)
             locals_map.setdefault(stmt.target.id, self._infer_type(stmt.value))
+            self._current_symbols.setdefault(stmt.target.id, self._infer_type(stmt.value))
         elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
             locals_map.setdefault(self._loop_target_name(stmt.target.id), ScalarType.INTEGER)
+            self._current_symbols.setdefault(self._loop_target_name(stmt.target.id), ScalarType.INTEGER)
+            for inner in stmt.body:
+                self._collect_locals(inner, locals_map)
+            for inner in stmt.orelse:
+                self._collect_locals(inner, locals_map)
+        elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Tuple):
+            for elt in stmt.target.elts:
+                if isinstance(elt, ast.Name):
+                    locals_map.setdefault(elt.id, ScalarType.REAL64)
+                    self._current_symbols.setdefault(elt.id, ScalarType.REAL64)
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
             for inner in stmt.orelse:
                 self._collect_locals(inner, locals_map)
         elif isinstance(stmt, ast.If):
+            self._collect_expr_locals(stmt.test, locals_map)
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
             for inner in stmt.orelse:
                 self._collect_locals(inner, locals_map)
+
+    def _collect_expr_locals(self, expr: ast.AST, locals_map: dict[str, object]) -> None:
+        for node in ast.walk(expr):
+            if isinstance(node, ast.ListComp):
+                if len(node.generators) == 1 and isinstance(node.generators[0].target, ast.Name):
+                    gen = node.generators[0]
+                    if not (isinstance(gen.iter, ast.Call) and isinstance(gen.iter.func, ast.Name) and gen.iter.func.id == "range"):
+                        index_name = f"{gen.target.id}_index"
+                        locals_map.setdefault(index_name, ScalarType.INTEGER)
+                        self._current_symbols.setdefault(index_name, ScalarType.INTEGER)
 
     def _lower_stmt(self, stmt: ast.stmt):
         if isinstance(stmt, ast.Assign):
@@ -139,6 +181,8 @@ class PythonNumpyFrontend:
             value = self._lower_expr(stmt.value)
             if isinstance(target, ast.Name):
                 return Assignment(ValueRef(target.id), value)
+            if isinstance(target, ast.Subscript):
+                return IndexAssignment(self._lower_expr(target.value), self._lower_expr(target.slice), value)
             if isinstance(target, ast.Tuple):
                 return self._lower_tuple_assignment(target, stmt.value)
             raise NotImplementedError(f"unsupported assignment target: {ast.dump(target)}")
@@ -159,6 +203,26 @@ class PythonNumpyFrontend:
                 orelse=tuple(self._lower_stmt(inner) for inner in stmt.orelse),
             )
         if isinstance(stmt, ast.For):
+            if (
+                isinstance(stmt.target, ast.Tuple)
+                and len(stmt.target.elts) == 2
+                and all(isinstance(elt, ast.Name) for elt in stmt.target.elts)
+                and isinstance(stmt.iter, ast.Call)
+                and isinstance(stmt.iter.func, ast.Name)
+                and stmt.iter.func.id == "enumerate"
+                and len(stmt.iter.args) == 1
+            ):
+                index_name = self._loop_target_name(stmt.target.elts[0].id)
+                value_name = stmt.target.elts[1].id
+                iterable_expr = self._lower_expr(stmt.iter.args[0])
+                body = [Assignment(ValueRef(value_name), IndexAccess(iterable_expr, ValueRef(index_name)))]
+                body.extend(self._lower_stmt(inner) for inner in stmt.body)
+                return ForRange(
+                    target=index_name,
+                    start=Constant(0),
+                    stop=Call("size", (iterable_expr,)),
+                    body=tuple(body),
+                )
             if not isinstance(stmt.target, ast.Name):
                 raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
             if not isinstance(stmt.iter, ast.Call) or not isinstance(stmt.iter.func, ast.Name) or stmt.iter.func.id != "range":
@@ -240,9 +304,18 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Constant):
             return Constant(expr.value)
         if isinstance(expr, ast.Name):
-            return ValueRef(expr.id)
+            return ValueRef(self._loop_target_name(expr.id) if expr.id == "_" else expr.id)
         if isinstance(expr, ast.List):
             return Call("ac_array_literal", tuple(self._lower_expr(elt) for elt in expr.elts))
+        if isinstance(expr, ast.ListComp):
+            if len(expr.generators) != 1:
+                raise NotImplementedError("only single-generator list comprehensions are supported")
+            gen = expr.generators[0]
+            if gen.ifs:
+                raise NotImplementedError("list comprehension filters are not yet supported")
+            if not isinstance(gen.target, ast.Name):
+                raise NotImplementedError("only simple list comprehension targets are supported")
+            return ListComprehension(gen.target.id, self._lower_expr(gen.iter), self._lower_expr(expr.elt))
         if isinstance(expr, ast.Dict):
             record_type = self._function_result_types.get(self._current_function or "")
             if not isinstance(record_type, RecordTypeRef):
@@ -269,6 +342,12 @@ class PythonNumpyFrontend:
                 return FieldAccess(self._lower_expr(expr.value), expr.slice.value)
             return IndexAccess(self._lower_expr(expr.value), self._lower_expr(expr.slice))
         if isinstance(expr, ast.BinOp):
+            if isinstance(expr.op, ast.Mult) and isinstance(expr.left, ast.List) and len(expr.left.elts) == 1:
+                return Call("ac_repeat", (self._lower_expr(expr.left.elts[0]), self._lower_expr(expr.right)))
+            if isinstance(expr.op, ast.Add) and (
+                isinstance(self._infer_type(expr.left), ArrayTypeRef) or isinstance(self._infer_type(expr.right), ArrayTypeRef)
+            ):
+                return Call("ac_concat", (self._lower_expr(expr.left), self._lower_expr(expr.right)))
             op_map = {
                 ast.Add: BinaryOperator.ADD,
                 ast.Sub: BinaryOperator.SUB,
@@ -317,8 +396,18 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.BoolOp):
             op = "and" if isinstance(expr.op, ast.And) else "or"
             return BooleanOp(op, tuple(self._lower_expr(value) for value in expr.values))
+        if isinstance(expr, ast.IfExp):
+            return ConditionalExpr(self._lower_expr(expr.test), self._lower_expr(expr.body), self._lower_expr(expr.orelse))
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Name):
+                if expr.func.id == "range":
+                    return Call("range", self._lower_call_args(expr))
+                if expr.func.id == "len":
+                    return Call("size", self._lower_call_args(expr))
+                if expr.func.id == "int":
+                    return Call("int", self._lower_call_args(expr))
+                if expr.func.id == "enumerate":
+                    return Call("ac_enumerate", self._lower_call_args(expr))
                 if expr.func.id in {"abs", "max", "min"}:
                     return Call(expr.func.id, self._lower_call_args(expr))
                 return Call(expr.func.id, self._lower_call_args(expr))
@@ -343,6 +432,12 @@ class PythonNumpyFrontend:
     def _lower_call_args(self, expr: ast.Call) -> tuple[object, ...]:
         values = [self._lower_expr(arg) for arg in expr.args]
         values.extend(self._lower_expr(keyword.value) for keyword in expr.keywords)
+        if isinstance(expr.func, ast.Name) and expr.func.id in self._function_arg_defaults:
+            defaults = self._function_arg_defaults[expr.func.id]
+            for index in range(len(values), len(defaults)):
+                default = defaults[index]
+                if default is not None:
+                    values.append(default)
         return tuple(values)
 
     def _infer_type(self, expr: ast.AST) -> object:
@@ -359,13 +454,29 @@ class PythonNumpyFrontend:
             return ScalarType.LOGICAL
         if isinstance(expr, ast.List):
             return ArrayTypeRef(ScalarType.REAL64)
+        if isinstance(expr, ast.ListComp):
+            return ArrayTypeRef(ScalarType.REAL64)
         if isinstance(expr, ast.Subscript):
+            container_type = self._infer_type(expr.value)
+            if isinstance(container_type, ArrayTypeRef):
+                return container_type.element_type
             return ScalarType.REAL64
         if isinstance(expr, ast.Dict):
             return self._function_result_types.get(self._current_function or "", ScalarType.REAL64)
         if isinstance(expr, ast.Tuple):
             return self._function_result_types.get(self._current_function or "", ScalarType.REAL64)
         if isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Name) and expr.func.id == "len":
+                return ScalarType.INTEGER
+            if isinstance(expr.func, ast.Name) and expr.func.id == "int":
+                return ScalarType.INTEGER
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"min", "max"} and expr.args:
+                arg_types = [self._infer_type(arg) for arg in expr.args]
+                if all(arg_type == ScalarType.INTEGER for arg_type in arg_types):
+                    return ScalarType.INTEGER
+                if any(isinstance(arg_type, ArrayTypeRef) for arg_type in arg_types):
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and self._is_strip_lower_chain(expr.func):
                 return ScalarType.STRING
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "strip":
@@ -382,11 +493,24 @@ class PythonNumpyFrontend:
                 return self._function_result_types.get(expr.func.id, ScalarType.REAL64)
             return ScalarType.REAL64
         if isinstance(expr, ast.Name):
-            return ScalarType.REAL64
+            return self._current_symbols.get(expr.id, ScalarType.REAL64)
         if isinstance(expr, ast.UnaryOp):
             return ScalarType.LOGICAL if isinstance(expr.op, ast.Not) else ScalarType.REAL64
         if isinstance(expr, ast.BinOp):
+            if isinstance(expr.op, ast.Add):
+                left_type = self._infer_type(expr.left)
+                right_type = self._infer_type(expr.right)
+                if isinstance(left_type, ArrayTypeRef) or isinstance(right_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.REAL64)
+            left_type = self._infer_type(expr.left)
+            right_type = self._infer_type(expr.right)
+            if left_type == ScalarType.INTEGER and right_type == ScalarType.INTEGER:
+                return ScalarType.INTEGER
+            if isinstance(expr.op, ast.Mult) and isinstance(expr.left, ast.List):
+                return ArrayTypeRef(ScalarType.REAL64)
             return ScalarType.REAL64
+        if isinstance(expr, ast.IfExp):
+            return self._infer_type(expr.body)
         return ScalarType.REAL64
 
     def _tuple_item_type(self, record_type: object, index: int) -> object:
@@ -410,6 +534,9 @@ class PythonNumpyFrontend:
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return None
         if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
+            if annotation.value.id == "list":
+                element_type = self._map_annotation(annotation.slice, function_name) or ScalarType.REAL64
+                return ArrayTypeRef(element_type)
             if annotation.value.id == "tuple":
                 fields = self._tuple_fields_from_annotation(annotation.slice)
                 name = f"{function_name}_result"

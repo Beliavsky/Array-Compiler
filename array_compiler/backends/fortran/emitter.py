@@ -14,6 +14,7 @@ from ...ir.nodes import (
     BinaryOperator,
     BooleanOp,
     Call,
+    ConditionalExpr,
     Compare,
     CompareOperator,
     Constant,
@@ -23,7 +24,9 @@ from ...ir.nodes import (
     ForRange,
     Function,
     If,
+    IndexAssignment,
     IndexAccess,
+    ListComprehension,
     Print,
     Raise,
     RecordLiteral,
@@ -34,6 +37,7 @@ from ...ir.nodes import (
     UnaryOperator,
     ValueRef,
 )
+from .formatter import wrap_fortran_source
 from .helpers import HelperRegistry
 
 
@@ -68,7 +72,7 @@ class FortranBackend:
             lines.extend(self._emit_program(module.program))
             lines.append("")
         lines.extend([f"end module {module.name}", ""])
-        return "\n".join(lines)
+        return wrap_fortran_source("\n".join(lines), max_len=132)
 
     def _emit_use_lines(self, helper_keys: set[str]) -> list[str]:
         lines: list[str] = ["use kind_mod, only: dp"]
@@ -155,6 +159,8 @@ class FortranBackend:
             return [f"{stmt.target.name} = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, Append):
             return [f"{stmt.target.name} = [{stmt.target.name}, {self._emit_expr(stmt.value)}]"]
+        if isinstance(stmt, IndexAssignment):
+            return [f"{self._emit_expr(stmt.target)}({self._emit_expr(stmt.index)} + 1) = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, FieldAssignment):
             return [f"{self._emit_expr(stmt.target)}%{stmt.field} = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, AugmentedAssignment):
@@ -219,6 +225,12 @@ class FortranBackend:
                 return self._emit_real(expr.value)
             return str(expr.value)
         if isinstance(expr, Call):
+            if expr.func == "ac_array_literal":
+                return self._emit_array_literal(expr.args, "")
+            if expr.func == "ac_repeat":
+                return f"spread({self._emit_expr(expr.args[0])}, 1, {self._emit_expr(expr.args[1])})"
+            if expr.func == "ac_concat":
+                return "[" + ", ".join(self._emit_expr(arg) for arg in expr.args) + "]"
             args = ", ".join(self._emit_expr(arg) for arg in expr.args)
             return f"{expr.func}({args})"
         if isinstance(expr, BinaryOp):
@@ -242,9 +254,15 @@ class FortranBackend:
         if isinstance(expr, BooleanOp):
             op = ".and." if expr.op == "and" else ".or."
             return "(" + f" {op} ".join(self._emit_expr(value) for value in expr.values) + ")"
+        if isinstance(expr, ConditionalExpr):
+            return f"merge({self._emit_expr(expr.body)}, {self._emit_expr(expr.orelse)}, {self._emit_expr(expr.test)})"
+        if isinstance(expr, ListComprehension):
+            return self._emit_list_comp(expr)
         return str(expr)
 
     def _declare_arg(self, name: str, value_type: object) -> str:
+        if isinstance(value_type, ArrayTypeRef):
+            return f"{self._type_name(value_type.element_type)}, intent(in) :: {name}(:)"
         if value_type == ScalarType.STRING:
             return f"character(len=*), intent(in) :: {name}"
         return f"{self._type_name(value_type)}, intent(in) :: {name}"
@@ -255,6 +273,8 @@ class FortranBackend:
         return f"{self._type_name(value_type)} :: {name}"
 
     def _declare_result(self, name: str, value_type: object) -> str:
+        if isinstance(value_type, ArrayTypeRef):
+            return f"{self._type_name(value_type.element_type)}, allocatable :: {name}(:)"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _declare_component(self, name: str, value_type: object) -> str:
@@ -287,6 +307,47 @@ class FortranBackend:
         if not values:
             return "[real(dp) :: ]"
         return "[" + ", ".join(self._emit_expr(value) for value in values) + "]"
+
+    def _emit_list_comp(self, expr: ListComprehension) -> str:
+        if isinstance(expr.iterable, Call) and expr.iterable.func == "range":
+            args = expr.iterable.args
+            if len(args) == 1:
+                start = "0"
+                stop = f"({self._emit_expr(args[0])} - 1)"
+                step = "1"
+            elif len(args) == 2:
+                start = self._emit_expr(args[0])
+                stop = f"({self._emit_expr(args[1])} - 1)"
+                step = "1"
+            else:
+                start = self._emit_expr(args[0])
+                stop = self._emit_expr(args[1])
+                step = self._emit_expr(args[2])
+            body_expr = self._emit_expr_with_binding(expr.body, {expr.target: expr.target})
+            return f"[( {body_expr}, {expr.target} = {start}, {stop}, {step} )]"
+
+        index_name = f"{expr.target}_index"
+        iterable_expr = self._emit_expr(expr.iterable)
+        bound_body = self._emit_expr_with_binding(expr.body, {expr.target: f"{iterable_expr}({index_name} + 1)"})
+        return f"[( {bound_body}, {index_name} = 0, size({iterable_expr}) - 1 )]"
+
+    def _emit_expr_with_binding(self, expr: object, bindings: dict[str, str]) -> str:
+        if isinstance(expr, ValueRef) and expr.name in bindings:
+            return bindings[expr.name]
+        if isinstance(expr, Constant):
+            return self._emit_expr(expr)
+        if isinstance(expr, BinaryOp):
+            if expr.op == BinaryOperator.POW:
+                return f"({self._emit_expr_with_binding(expr.left, bindings)} ** {self._emit_expr_with_binding(expr.right, bindings)})"
+            return f"({self._emit_expr_with_binding(expr.left, bindings)} {expr.op.value} {self._emit_expr_with_binding(expr.right, bindings)})"
+        if isinstance(expr, UnaryOp):
+            if expr.op == UnaryOperator.NOT:
+                return f"(.not. {self._emit_expr_with_binding(expr.operand, bindings)})"
+            return f"({expr.op.value}{self._emit_expr_with_binding(expr.operand, bindings)})"
+        if isinstance(expr, Call):
+            if expr.func in {"abs", "max", "min", "exp", "sqrt", "log", "int", "floor", "size"}:
+                return f"{expr.func}(" + ", ".join(self._emit_expr_with_binding(arg, bindings) for arg in expr.args) + ")"
+        return self._emit_expr(expr)
 
     def _required_helpers(self, module: Module) -> set[str]:
         helper_keys: set[str] = set()

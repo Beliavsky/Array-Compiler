@@ -81,6 +81,20 @@ class IndexAccess:
 
 
 @dataclass(frozen=True)
+class ConditionalExpr:
+    test: object
+    body: object
+    orelse: object
+
+
+@dataclass(frozen=True)
+class ListComprehension:
+    target: str
+    iterable: object
+    body: object
+
+
+@dataclass(frozen=True)
 class RecordLiteral:
     type_name: str
     fields: tuple[tuple[str, object], ...]
@@ -122,6 +136,13 @@ class Assignment:
 class FieldAssignment:
     target: object
     field: str
+    value: object
+
+
+@dataclass(frozen=True)
+class IndexAssignment:
+    target: object
+    index: object
     value: object
 
 

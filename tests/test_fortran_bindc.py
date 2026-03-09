@@ -92,7 +92,7 @@ def test_bindc_scalar_wrapper_compiles_and_runs() -> None:
         exe_file = tmp / "test_driver.exe"
 
         compile_proc = subprocess.run(
-            ["gfortran", str(kind_mod_file), str(module_file), str(bindc_file), str(driver_file), "-o", str(exe_file)],
+            ["gfortran", "-std=f2018", str(kind_mod_file), str(module_file), str(bindc_file), str(driver_file), "-o", str(exe_file)],
             capture_output=True,
             text=True,
             check=False,

@@ -2,6 +2,7 @@ from array_compiler.backends.fortran import FortranBackend
 from array_compiler.compiler import Compiler
 from array_compiler.ir.module import Module
 from array_compiler.ir.nodes import Call, Constant, Function, Return, ScalarType, ValueRef
+from test_utils import assert_max_fortran_line_length
 
 
 def test_simple_function_emission() -> None:
