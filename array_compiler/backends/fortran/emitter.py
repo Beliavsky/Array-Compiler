@@ -198,7 +198,8 @@ class FortranBackend:
             if stmt.step is None:
                 stop = f"({self._emit_expr(stmt.stop)} - 1)"
             else:
-                stop = self._emit_expr(stmt.stop)
+                raw_stop = self._emit_expr(stmt.stop)
+                stop = f"merge(({raw_stop} - 1), ({raw_stop} + 1), ({step} > 0))"
             lines = [f"do {stmt.target} = {start}, {stop}, {step}"]
             for inner in stmt.body:
                 lines.extend("    " + line for line in self._emit_stmt(inner, result_name))

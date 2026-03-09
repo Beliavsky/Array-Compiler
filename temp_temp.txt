@@ -1,0 +1,8 @@
+ Volume in drive C has no label.
+ Volume Serial Number is 96D7-9435
+
+ Directory of c:\python\Array-Compiler
+
+03/09/2026  12:18 PM               922 commit_wrap_lines.bat
+               1 File(s)            922 bytes
+               0 Dir(s)  26,905,681,920 bytes free
