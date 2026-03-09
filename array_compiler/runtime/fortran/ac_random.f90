@@ -16,7 +16,8 @@ end type ac_random_state
 contains
 
 function ac_random_init(seed) result(state)
-implicit none
+! Initialize the shared random-number generator state.
+! seed: integer seed used to populate random_seed.
 integer, intent(in) :: seed
 type(ac_random_state) :: state
 integer :: n, i
@@ -36,7 +37,10 @@ state%seed = seed
 end function ac_random_init
 
 function ac_gauss(state, mean, stddev) result(value)
-implicit none
+! Draw one Gaussian variate using the Box-Muller transform.
+! state: mutable RNG state placeholder.
+! mean: target mean.
+! stddev: target standard deviation.
 type(ac_random_state), intent(inout) :: state
 real(dp), intent(in) :: mean
 real(dp), intent(in) :: stddev

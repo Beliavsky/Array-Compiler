@@ -1,7 +1,7 @@
 from array_compiler.backends.fortran import FortranBackend
 from array_compiler.compiler import Compiler
 from array_compiler.ir.module import Module
-from array_compiler.ir.nodes import Call, Constant, Function, Return, ScalarType, ValueRef
+from array_compiler.ir.nodes import Call, Compare, CompareOperator, Function, If, Raise, Return, ScalarType, ValueRef
 from test_utils import assert_max_fortran_line_length
 
 
@@ -41,3 +41,27 @@ def test_library_exports_can_be_set_explicitly() -> None:
     source = Compiler().emit_fortran_library(module)
     assert "public :: f" in source
     assert "public :: g" not in source
+
+
+def test_emitter_uses_module_level_implicit_none_one_line_if_and_pure_attrs() -> None:
+    module = Module(
+        name="style_mod",
+        functions=[
+            Function(
+                name="normal_cdf",
+                args=[("x", ScalarType.REAL64)],
+                result_type=ScalarType.REAL64,
+                body=[Return(Call("sin", (ValueRef("x"),)))],
+            ),
+            Function(
+                name="guard",
+                args=[("x", ScalarType.REAL64)],
+                result_type=None,
+                body=[If(Compare(ValueRef("x"), CompareOperator.LE, ValueRef("x")), (Raise("bad"),), ())],
+            ),
+        ],
+    )
+    source = FortranBackend().emit(module)
+    assert source.count("implicit none") == 1
+    assert "pure elemental function normal_cdf(x) result(result_value)" in source
+    assert 'if (x <= x) error stop "bad"' in source

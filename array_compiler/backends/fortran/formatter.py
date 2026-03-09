@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def wrap_fortran_source(source: str, max_len: int = 132) -> str:
+def wrap_fortran_source(source: str, max_len: int = 80) -> str:
     """Wrap overlong free-form Fortran lines conservatively."""
     wrapped_lines: list[str] = []
     for line in source.splitlines():
@@ -72,6 +72,11 @@ def _find_split_point(line: str, limit: int) -> tuple[int, bool] | None:
         if ch in ",)]":
             best = (idx, True)
             continue
-        if ch in "+-*/=":
+        if ch in "+-*=":
+            best = (idx, False)
+            continue
+        if ch == "/" and not (
+            (idx > 0 and line[idx - 1] == "/") or (idx + 1 < len(line) and line[idx + 1] == "/")
+        ):
             best = (idx, False)
     return best

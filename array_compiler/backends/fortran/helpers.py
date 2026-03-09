@@ -22,6 +22,7 @@ class HelperRegistry:
         self.root = root or Path(__file__).resolve().parents[2] / "runtime" / "fortran"
         self._helpers: dict[str, HelperModule] = {
             "kind_mod": HelperModule("kind_mod", "kind.f90", "Shared kind parameters for generated Fortran"),
+            "ac_string": HelperModule("ac_string", "ac_string.f90", "Small string helper runtime for generated Fortran"),
             "ac_random": HelperModule("ac_random", "ac_random.f90", "Small RNG helper runtime for translated scalar Monte Carlo code"),
             "ac_numpy": HelperModule("ac_numpy", "ac_numpy.f90", "Small NumPy-style runtime helpers for generated Fortran"),
             "lapack_d": HelperModule("lapack_d", "lapack_d.f90", "LAPACK and dense linear algebra helpers"),

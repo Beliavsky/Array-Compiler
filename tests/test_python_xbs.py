@@ -16,15 +16,23 @@ def test_xbs_lowers_and_emits_fortran() -> None:
     assert module.exports == ["normal_cdf", "black_scholes_price", "run_example"]
     assert "module xbs_mod" in source
     assert "use kind_mod, only: dp" in source
+    assert "use ac_string_mod, only: ac_lower" in source
     assert "private" in source
     assert "public :: normal_cdf, black_scholes_price, run_example" in source
-    assert "function normal_cdf(x) result(result_value)" in source
-    assert "function black_scholes_price(spot, strike, rate, volatility, time_to_maturity, option_type) result(result_value)" in source
+    assert "pure elemental function normal_cdf(x) result(result_value)" in source
+    assert "pure elemental function black_scholes_price(spot, strike, rate, volatility, &" in source
+    assert "& time_to_maturity, option_type) result(result_value)" in source
+    assert "real(dp), intent(in) :: spot, strike, rate, volatility, time_to_maturity" in source
     assert "subroutine run_example()" in source
     assert "subroutine run_main()" in source
+    assert "real(dp), parameter :: spot = 100.0d0, strike = 100.0d0, rate = 0.05d0, &" in source
+    assert "& volatility = 0.2d0, time_to_maturity = 1.0d0" in source
+    assert "\ntolerance = 1d-10\n" in source
+    assert "\nspot = 100.0d0\n" not in source
     assert "option_kind = ac_lower(trim(adjustl(option_type)))" in source
-    assert "if (((option_kind /= 'call') .and. (option_kind /= 'put'))) then" in source
-    assert "error stop 'option_type must be ''call'' or ''put'''" in source
+    assert 'if ((option_kind /= "call") .and. (option_kind /= "put")) error stop &' in source
+    assert '& "option_type must be \'call\' or \'put\'"' in source
+    assert "return" not in source
     assert "call run_example()" in source
 
 

@@ -17,11 +17,13 @@ def test_xoptions_pde_lowers_and_emits_fortran() -> None:
 
     assert module.exports == ["solve_tridiagonal", "finite_difference_option_price", "print_example", "run_example"]
     assert "function solve_tridiagonal(lower, diag, upper, rhs) result(result_value)" in source
-    assert "real(dp), intent(in) :: diag(:)" in source
+    assert "real(dp), intent(in) :: lower(:), diag(:), upper(:), rhs(:)" in source
     assert "real(dp), allocatable :: result_value(:)" in source
-    assert "spots = [( (i * d_spot), i = 0, ((num_asset_steps + 1) - 1), 1 )]" in source
-    assert "values = [( max((spots(s_index + 1) - strike), 0.0d0), s_index = 0, size(spots) - 1 )]" in source
-    assert "values = [[[left_boundary_current], interior_values], [right_boundary_current]]" in source
+    assert "spots = [( i * d_spot, i = 0, (num_asset_steps + 1 - 1), 1 )]" in source
+    assert "values = [( max(spots(s_index + 1) - strike, 0.0d0), s_index = 0, &" in source
+    assert "& size(spots) - 1 )]" in source
+    assert "values = [[[left_boundary_current], interior_values], &" in source
+    assert "& [right_boundary_current]]" in source
     assert "values(i + 1) = max(values(i + 1), intrinsic_value)" in source
     assert "call print_example(0.0d0)" in source
     assert "call print_example(0.08d0)" in source
@@ -31,16 +33,19 @@ def test_xoptions_pde_emitted_fortran_compiles() -> None:
     module = PythonNumpyFrontend().lower_source(XPDE_PATH.read_text(), module_name="xpde_mod")
     source = FortranBackend().emit(module)
     kind_mod_path = HelperRegistry().path_for("kind_mod")
+    ac_string_path = HelperRegistry().path_for("ac_string")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         kind_mod_copy = tmp / kind_mod_path.name
         kind_mod_copy.write_text(kind_mod_path.read_text())
+        ac_string_copy = tmp / ac_string_path.name
+        ac_string_copy.write_text(ac_string_path.read_text())
         module_file = tmp / "xpde_mod.f90"
         module_file.write_text(source)
 
         compile_proc = subprocess.run(
-            ["gfortran", "-std=f2018", str(kind_mod_copy), str(module_file), "-c"],
+            ["gfortran", "-std=f2018", str(kind_mod_copy), str(ac_string_copy), str(module_file), "-c"],
             capture_output=True,
             text=True,
             check=False,
@@ -48,7 +53,7 @@ def test_xoptions_pde_emitted_fortran_compiles() -> None:
         assert compile_proc.returncode == 0, compile_proc.stderr
 
 
-def test_xoptions_pde_emitted_fortran_stays_within_132_columns() -> None:
+def test_xoptions_pde_emitted_fortran_stays_within_80_columns() -> None:
     module = PythonNumpyFrontend().lower_source(XPDE_PATH.read_text(), module_name="xpde_mod")
     source = FortranBackend().emit(module)
-    assert_max_fortran_line_length(source, max_len=132)
+    assert_max_fortran_line_length(source, max_len=80)

@@ -14,6 +14,7 @@ from enum import Enum
 class ScalarType(str, Enum):
     INTEGER = "integer"
     REAL64 = "real64"
+    COMPLEX128 = "complex128"
     LOGICAL = "logical"
     STRING = "string"
 

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -7,7 +8,37 @@ from contextlib import contextmanager
 from array_compiler.backends.fortran.helpers import HelperRegistry
 
 
-def assert_max_fortran_line_length(source: str, max_len: int = 132) -> None:
+HELPER_MODULE_KEYS = {
+    "kind_mod": "kind_mod",
+    "ac_string_mod": "ac_string",
+    "ac_random_support": "ac_random",
+    "ac_numpy_mod": "ac_numpy",
+}
+
+HELPER_ORDER = ["kind_mod", "ac_string", "ac_random", "ac_numpy", "lapack_d", "python", "octave_funcs", "r"]
+HELPER_DEPENDENCIES = {
+    "ac_numpy": {"ac_random"},
+}
+
+
+def helper_keys_for_source(fortran_source: str) -> list[str]:
+    used_modules = {
+        match.group(1).lower()
+        for match in re.finditer(r"^\s*use\s+([a-z][a-z0-9_]*)\b", fortran_source, flags=re.IGNORECASE | re.MULTILINE)
+    }
+    helper_keys = {HELPER_MODULE_KEYS[module] for module in used_modules if module in HELPER_MODULE_KEYS}
+    changed = True
+    while changed:
+        changed = False
+        for key in list(helper_keys):
+            for dependency in HELPER_DEPENDENCIES.get(key, set()):
+                if dependency not in helper_keys:
+                    helper_keys.add(dependency)
+                    changed = True
+    return [key for key in HELPER_ORDER if key in helper_keys]
+
+
+def assert_max_fortran_line_length(source: str, max_len: int = 80) -> None:
     overlong = [
         (line_no, len(line), line)
         for line_no, line in enumerate(source.splitlines(), start=1)
@@ -28,14 +59,25 @@ def compiled_fortran_module_with_driver(
 ) -> Path:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        kind_mod_path = HelperRegistry().path_for("kind_mod")
-        copied_sources = [tmp / kind_mod_path.name]
-        copied_sources[0].write_text(kind_mod_path.read_text())
-
-        for source_path in extra_sources or []:
+        registry = HelperRegistry()
+        copied_sources: list[Path] = []
+        copied_names: set[str] = set()
+        for key in helper_keys_for_source(module_source):
+            source_path = registry.path_for(key)
+            if source_path.name in copied_names:
+                continue
             copied = tmp / source_path.name
             copied.write_text(source_path.read_text())
             copied_sources.append(copied)
+            copied_names.add(source_path.name)
+
+        for source_path in extra_sources or []:
+            if source_path.name in copied_names:
+                continue
+            copied = tmp / source_path.name
+            copied.write_text(source_path.read_text())
+            copied_sources.append(copied)
+            copied_names.add(source_path.name)
 
         module_file = tmp / f"{module_name}.f90"
         module_file.write_text(module_source)

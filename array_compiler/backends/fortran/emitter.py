@@ -77,14 +77,37 @@ AC_NUMPY_FUNCS = {
     "ac_copy",
     "ac_sub_col",
     "ac_mul_col",
+    "ac_reverse",
+    "ac_r_concat",
+    "ac_roots",
+    "ac_normal_vec",
+    "ac_zeros",
+    "ac_zeros2",
+    "ac_dot",
+    "ac_mean",
+    "ac_slice",
+    "ac_set_slice",
+    "ac_fill_slice",
+    "ac_arange",
+    "ac_arange_int",
+    "ac_column_stack",
+    "ac_round",
+    "ac_solve_linear",
+    "ac_item2",
+    "ac_set_item2",
 }
 
 
 @dataclass
 class FortranBackend:
     helper_registry: HelperRegistry = field(default_factory=HelperRegistry)
+    _current_symbols: dict[str, object] = field(default_factory=dict, init=False)
+    _record_types: dict[str, object] = field(default_factory=dict, init=False)
+    _function_results: dict[str, object] = field(default_factory=dict, init=False)
 
     def emit(self, module: Module) -> str:
+        self._record_types = {record.name: record for record in module.records}
+        self._function_results = {fn.name: fn.result_type for fn in module.functions}
         helper_keys = self._required_helpers(module)
         export_names = self._export_names(module)
         lines: list[str] = [
@@ -101,8 +124,6 @@ class FortranBackend:
         lines.extend([
             "contains",
             "",
-            *self._emit_lower_helper(),
-            "",
         ])
         for fn in module.functions:
             lines.extend(self._emit_function(fn))
@@ -111,10 +132,16 @@ class FortranBackend:
             lines.extend(self._emit_program(module.program))
             lines.append("")
         lines.extend([f"end module {module.name}", ""])
-        return wrap_fortran_source("\n".join(lines), max_len=132)
+        return wrap_fortran_source("\n".join(lines), max_len=80)
 
     def _emit_use_lines(self, helper_keys: set[str]) -> list[str]:
         lines: list[str] = ["use kind_mod, only: dp"]
+        if "ac_string" in helper_keys:
+            lines.append(
+                "use ac_string_mod, only: ac_lower, ac_format_default, ac_format_fixed, &"
+            )
+            lines.append("    & ac_format_scientific, ac_format_int, ac_format_array, &")
+            lines.append("    & ac_set_printoptions")
         if "ac_random" in helper_keys:
             lines.append("use ac_random_support, only: ac_random_state, ac_random_init, ac_gauss")
         if "ac_numpy" in helper_keys:
@@ -143,56 +170,58 @@ class FortranBackend:
         lines.append(f"end type {record.name}")
         return lines
 
-    def _emit_lower_helper(self) -> list[str]:
-        return [
-            "pure function ac_lower(value) result(out)",
-            "implicit none",
-            "character(len=*), intent(in) :: value",
-            "character(len=len(value)) :: out",
-            "integer :: i, code",
-            "out = value",
-            "do i = 1, len(value)",
-            "    code = iachar(value(i:i))",
-            "    if (code >= iachar('A') .and. code <= iachar('Z')) then",
-            "        out(i:i) = achar(code + 32)",
-            "    end if",
-            "end do",
-            "end function ac_lower",
-        ]
-
     def _emit_function(self, fn: Function) -> list[str]:
+        attrs = self._procedure_attrs(fn)
+        parameter_values, local_values, body = self._extract_local_parameters(fn.locals, fn.body)
+        previous_symbols = self._current_symbols
         if fn.result_type is None:
             arg_text = ", ".join(name for name, _ in fn.args)
-            lines = [f"subroutine {fn.name}({arg_text})", "implicit none"]
-            for name, typ in fn.args:
-                lines.append(self._declare_arg(name, typ))
-            for name, typ in fn.locals:
-                lines.append(self._declare_local(name, typ))
-            for stmt in fn.body:
+            prefix = (attrs + " ") if attrs else ""
+            self._current_symbols = {name: typ for name, typ in fn.args}
+            self._current_symbols.update({name: typ for name, typ in fn.locals})
+            lines = [f"{prefix}subroutine {fn.name}({arg_text})"]
+            lines.extend(self._declare_args(fn.args))
+            lines.extend(self._declare_parameters(parameter_values))
+            lines.extend(self._declare_locals(local_values))
+            body = self._trim_terminal_return(body, "")
+            for stmt in body:
                 lines.extend(self._emit_stmt(stmt, result_name=""))
             lines.append(f"end subroutine {fn.name}")
+            self._current_symbols = previous_symbols
             return lines
 
         result_name = "result_value"
         arg_text = ", ".join(name for name, _ in fn.args)
-        lines = [f"function {fn.name}({arg_text}) result({result_name})", "implicit none"]
-        for name, typ in fn.args:
-            lines.append(self._declare_arg(name, typ))
-        for name, typ in fn.locals:
-            lines.append(self._declare_local(name, typ))
+        prefix = (attrs + " ") if attrs else ""
+        self._current_symbols = {name: typ for name, typ in fn.args}
+        self._current_symbols.update({name: typ for name, typ in fn.locals})
+        self._current_symbols[result_name] = fn.result_type
+        lines = [f"{prefix}function {fn.name}({arg_text}) result({result_name})"]
+        lines.extend(self._declare_args(fn.args))
+        lines.extend(self._declare_parameters(parameter_values))
+        lines.extend(self._declare_locals(local_values))
         lines.append(self._declare_result(result_name, fn.result_type))
-        for stmt in fn.body:
+        body = self._trim_terminal_return(body, result_name)
+        for stmt in body:
             lines.extend(self._emit_stmt(stmt, result_name))
         lines.append(f"end function {fn.name}")
+        self._current_symbols = previous_symbols
         return lines
 
     def _emit_program(self, program) -> list[str]:
-        lines = [f"subroutine {program.name}()", "implicit none"]
-        for name, typ in getattr(program, "locals", []):
-            lines.append(self._declare_local(name, typ))
-        for stmt in program.body:
+        parameter_values, local_values, body = self._extract_local_parameters(
+            getattr(program, "locals", []),
+            program.body,
+        )
+        previous_symbols = self._current_symbols
+        self._current_symbols = {name: typ for name, typ in getattr(program, "locals", [])}
+        lines = [f"subroutine {program.name}()"]
+        lines.extend(self._declare_parameters(parameter_values))
+        lines.extend(self._declare_locals(local_values))
+        for stmt in body:
             lines.extend(self._emit_stmt(stmt, result_name=""))
         lines.append(f"end subroutine {program.name}")
+        self._current_symbols = previous_symbols
         return lines
 
     def _emit_stmt(self, stmt: object, result_name: str) -> list[str]:
@@ -203,13 +232,16 @@ class FortranBackend:
         if isinstance(stmt, Append):
             return [f"{stmt.target.name} = [{stmt.target.name}, {self._emit_expr(stmt.value)}]"]
         if isinstance(stmt, IndexAssignment):
-            return [f"{self._emit_expr(stmt.target)}({self._emit_expr(stmt.index)} + 1) = {self._emit_expr(stmt.value)}"]
+            index_text = self._emit_index_selector(stmt.index)
+            if index_text is None:
+                index_text = f"{self._emit_expr(stmt.index)} + 1"
+            return [f"{self._emit_expr(stmt.target)}({index_text}) = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, FieldAssignment):
             return [f"{self._emit_expr(stmt.target)}%{stmt.field} = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, AugmentedAssignment):
             target = stmt.target.name
             value = self._emit_expr(stmt.value)
-            return [f"{target} = ({target} {stmt.op.value} {value})"]
+            return [f"{target} = {target} {stmt.op.value} {value}"]
         if isinstance(stmt, Return):
             if stmt.value is not None and result_name:
                 return [f"{result_name} = {self._emit_expr(stmt.value)}", "return"]
@@ -223,13 +255,30 @@ class FortranBackend:
         if isinstance(stmt, Print):
             if not stmt.values:
                 return ["print *"]
+            rendered = [self._render_print_value(value) for value in stmt.values]
+            if all(is_string for _, is_string in rendered):
+                text = self._join_rendered_print_values(stmt.values, rendered)
+                return [f'write(*, "(a)") {text}']
             parts = ", ".join(self._emit_expr(value) for value in stmt.values)
             return [f"print *, {parts}"]
         if isinstance(stmt, ExprStatement):
             if isinstance(stmt.expr, Call):
+                if stmt.expr.func == "ac_fill_slice":
+                    array_expr, start_expr, stop_expr, value_expr = stmt.expr.args
+                    base = self._emit_expr(array_expr)
+                    start_text = self._emit_expr(start_expr)
+                    stop_text = self._emit_expr(stop_expr)
+                    value_text = self._emit_expr(value_expr)
+                    return [f"{base}(({start_text}) + 1:{stop_text}) = {value_text}"]
                 return [f"call {stmt.expr.func}({', '.join(self._emit_expr(arg) for arg in stmt.expr.args)})"]
             raise NotImplementedError(f"unsupported expression statement: {stmt.expr!r}")
         if isinstance(stmt, If):
+            simple_body = len(stmt.body) == 1 and not stmt.orelse
+            simple_stmt = stmt.body[0] if simple_body else None
+            if simple_stmt is not None:
+                one_line = self._emit_one_line_if(stmt.test, simple_stmt, result_name)
+                if one_line is not None:
+                    return [one_line]
             lines = [f"if ({self._emit_expr(stmt.test)}) then"]
             for inner in stmt.body:
                 lines.extend("    " + line for line in self._emit_stmt(inner, result_name))
@@ -260,7 +309,10 @@ class FortranBackend:
         if isinstance(expr, FieldAccess):
             return f"{self._emit_expr(expr.value)}%{expr.field}"
         if isinstance(expr, IndexAccess):
-            return f"{self._emit_expr(expr.value)}({self._emit_expr(expr.index)} + 1)"
+            index_text = self._emit_index_selector(expr.index)
+            if index_text is None:
+                index_text = f"{self._emit_expr(expr.index)} + 1"
+            return f"{self._emit_expr(expr.value)}({index_text})"
         if isinstance(expr, RecordLiteral):
             fields = ", ".join(f"{name}={self._emit_expr(value)}" for name, value in expr.fields)
             return f"{expr.type_name}({fields})"
@@ -281,6 +333,10 @@ class FortranBackend:
                 return self._emit_array_literal(expr.args, "")
             if expr.func == "ac_array" and len(expr.args) == 1 and self._is_nested_array_literal(expr.args[0]):
                 return f"ac_array({self._emit_nested_array(expr.args[0])})"
+            if expr.func == "ac_arange_int":
+                start_text = self._emit_expr(expr.args[0])
+                stop_text = self._emit_expr(expr.args[1])
+                return f"[( {start_text} + ac_i - 1, ac_i = 1, max(0, {stop_text} - {start_text}) )]"
             if expr.func == "float":
                 return f"ac_float({self._emit_expr(expr.args[0])})"
             if expr.func == "ac_repeat":
@@ -291,12 +347,12 @@ class FortranBackend:
             return f"{expr.func}({args})"
         if isinstance(expr, BinaryOp):
             if expr.op == BinaryOperator.POW:
-                return f"({self._emit_expr(expr.left)} ** {self._emit_expr(expr.right)})"
-            return f"({self._emit_expr(expr.left)} {expr.op.value} {self._emit_expr(expr.right)})"
+                return f"{self._emit_operand(expr.left)} ** {self._emit_operand(expr.right)}"
+            return f"{self._emit_operand(expr.left)} {expr.op.value} {self._emit_operand(expr.right)}"
         if isinstance(expr, UnaryOp):
             if expr.op == UnaryOperator.NOT:
-                return f"(.not. {self._emit_expr(expr.operand)})"
-            return f"({expr.op.value}{self._emit_expr(expr.operand)})"
+                return f".not. {self._emit_operand(expr.operand)}"
+            return f"{expr.op.value}{self._emit_operand(expr.operand)}"
         if isinstance(expr, Compare):
             op_map = {
                 CompareOperator.EQ: "==",
@@ -306,29 +362,113 @@ class FortranBackend:
                 CompareOperator.GT: ">",
                 CompareOperator.GE: ">=",
             }
-            return f"({self._emit_expr(expr.left)} {op_map[expr.op]} {self._emit_expr(expr.right)})"
+            return f"{self._emit_operand(expr.left)} {op_map[expr.op]} {self._emit_operand(expr.right)}"
         if isinstance(expr, BooleanOp):
             op = ".and." if expr.op == "and" else ".or."
-            return "(" + f" {op} ".join(self._emit_expr(value) for value in expr.values) + ")"
+            return f" {op} ".join(self._emit_operand(value) for value in expr.values)
         if isinstance(expr, ConditionalExpr):
             return f"merge({self._emit_expr(expr.body)}, {self._emit_expr(expr.orelse)}, {self._emit_expr(expr.test)})"
         if isinstance(expr, ListComprehension):
             return self._emit_list_comp(expr)
         return str(expr)
 
-    def _declare_arg(self, name: str, value_type: object) -> str:
-        if isinstance(value_type, ArrayTypeRef):
-            dims = self._array_dims(value_type.rank)
-            return f"{self._type_name(value_type.element_type)}, intent(in) :: {name}{dims}"
-        if value_type == ScalarType.STRING:
-            return f"character(len=*), intent(in) :: {name}"
-        return f"{self._type_name(value_type)}, intent(in) :: {name}"
+    def _declare_args(self, values: list[tuple[str, object]]) -> list[str]:
+        return self._coalesce_declarations(values, self._arg_decl_parts)
 
-    def _declare_local(self, name: str, value_type: object) -> str:
+    def _declare_locals(self, values: list[tuple[str, object]]) -> list[str]:
+        return self._coalesce_declarations(values, self._local_decl_parts)
+
+    def _declare_parameters(
+        self,
+        values: list[tuple[str, object, Constant]],
+    ) -> list[str]:
+        lines: list[str] = []
+        current_spec: str | None = None
+        current_names: list[str] = []
+        for name, value_type, constant in values:
+            spec = f"{self._type_name(value_type)}, parameter"
+            name_expr = f"{name} = {self._emit_expr(constant)}"
+            if current_spec == spec:
+                current_names.append(name_expr)
+                continue
+            if current_spec is not None:
+                lines.append(f"{current_spec} :: {', '.join(current_names)}")
+            current_spec = spec
+            current_names = [name_expr]
+        if current_spec is not None:
+            lines.append(f"{current_spec} :: {', '.join(current_names)}")
+        return lines
+
+    def _coalesce_declarations(self, values: list[tuple[str, object]], part_builder) -> list[str]:
+        lines: list[str] = []
+        current_spec: str | None = None
+        current_names: list[str] = []
+        for name, value_type in values:
+            spec, name_expr = part_builder(name, value_type)
+            if current_spec == spec:
+                current_names.append(name_expr)
+                continue
+            if current_spec is not None:
+                lines.append(f"{current_spec} :: {', '.join(current_names)}")
+            current_spec = spec
+            current_names = [name_expr]
+        if current_spec is not None:
+            lines.append(f"{current_spec} :: {', '.join(current_names)}")
+        return lines
+
+    def _extract_local_parameters(
+        self,
+        locals_list: list[tuple[str, object]],
+        body: list[object],
+    ) -> tuple[list[tuple[str, object, Constant]], list[tuple[str, object]], list[object]]:
+        local_types = {name: value_type for name, value_type in locals_list}
+        parameter_names: set[str] = set()
+        parameter_values: dict[str, Constant] = {}
+        leading_assignment_count = 0
+        for stmt in body:
+            if not isinstance(stmt, Assignment):
+                break
+            name = stmt.target.name
+            value_type = local_types.get(name)
+            if (
+                value_type in {ScalarType.INTEGER, ScalarType.REAL64, ScalarType.LOGICAL}
+                and isinstance(stmt.value, Constant)
+                and name not in parameter_names
+            ):
+                parameter_names.add(name)
+                parameter_values[name] = stmt.value
+                leading_assignment_count += 1
+                continue
+            break
+        if not parameter_names:
+            return [], locals_list, body
+
+        parameters = [
+            (name, value_type, parameter_values[name])
+            for name, value_type in locals_list
+            if name in parameter_names
+        ]
+        filtered_locals = [
+            (name, value_type)
+            for name, value_type in locals_list
+            if name not in parameter_names
+        ]
+        filtered_body = body[leading_assignment_count:]
+        return parameters, filtered_locals, filtered_body
+
+    def _arg_decl_parts(self, name: str, value_type: object) -> tuple[str, str]:
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
-            return f"{self._type_name(value_type)} , allocatable :: {name}{dims}"
-        return f"{self._type_name(value_type)} :: {name}"
+            return f"{self._type_name(value_type.element_type)}, intent(in)", f"{name}{dims}"
+        if value_type == ScalarType.STRING:
+            return "character(len=*), intent(in)", name
+        return f"{self._type_name(value_type)}, intent(in)", name
+
+    def _local_decl_parts(self, name: str, value_type: object) -> tuple[str, str]:
+        if isinstance(value_type, ArrayTypeRef):
+            dims = self._array_dims(value_type.rank)
+            return f"{self._type_name(value_type)}, allocatable", f"{name}{dims}"
+        return self._type_name(value_type), name
 
     def _declare_result(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
@@ -343,8 +483,8 @@ class FortranBackend:
         return f"{self._type_name(value_type)} :: {name}"
 
     def _emit_string(self, value: str) -> str:
-        escaped = value.replace("'", "''")
-        return f"'{escaped}'"
+        escaped = value.replace('"', '""')
+        return f'"{escaped}"'
 
     def _emit_real(self, value: float) -> str:
         text = repr(value).lower()
@@ -360,6 +500,7 @@ class FortranBackend:
         mapping = {
             ScalarType.INTEGER: "integer",
             ScalarType.REAL64: "real(dp)",
+            ScalarType.COMPLEX128: "complex(dp)",
             ScalarType.LOGICAL: "logical",
             ScalarType.STRING: "character(len=:), allocatable",
         }
@@ -420,22 +561,193 @@ class FortranBackend:
             return self._emit_expr(expr)
         if isinstance(expr, BinaryOp):
             if expr.op == BinaryOperator.POW:
-                return f"({self._emit_expr_with_binding(expr.left, bindings)} ** {self._emit_expr_with_binding(expr.right, bindings)})"
-            return f"({self._emit_expr_with_binding(expr.left, bindings)} {expr.op.value} {self._emit_expr_with_binding(expr.right, bindings)})"
+                return f"{self._emit_operand_with_binding(expr.left, bindings)} ** {self._emit_operand_with_binding(expr.right, bindings)}"
+            return f"{self._emit_operand_with_binding(expr.left, bindings)} {expr.op.value} {self._emit_operand_with_binding(expr.right, bindings)}"
         if isinstance(expr, UnaryOp):
             if expr.op == UnaryOperator.NOT:
-                return f"(.not. {self._emit_expr_with_binding(expr.operand, bindings)})"
-            return f"({expr.op.value}{self._emit_expr_with_binding(expr.operand, bindings)})"
+                return f".not. {self._emit_operand_with_binding(expr.operand, bindings)}"
+            return f"{expr.op.value}{self._emit_operand_with_binding(expr.operand, bindings)}"
         if isinstance(expr, Call):
             if expr.func in {"abs", "max", "min", "exp", "sqrt", "log", "int", "floor", "size"}:
                 return f"{expr.func}(" + ", ".join(self._emit_expr_with_binding(arg, bindings) for arg in expr.args) + ")"
         return self._emit_expr(expr)
 
+    def _emit_operand(self, expr: object) -> str:
+        text = self._emit_expr(expr)
+        if isinstance(expr, (BinaryOp, Compare, BooleanOp, ConditionalExpr)):
+            return f"({text})"
+        return text
+
+    def _emit_operand_with_binding(self, expr: object, bindings: dict[str, str]) -> str:
+        text = self._emit_expr_with_binding(expr, bindings)
+        if isinstance(expr, (BinaryOp, Compare, BooleanOp, ConditionalExpr)):
+            return f"({text})"
+        return text
+
+    def _trim_terminal_return(self, body: list[object], result_name: str) -> list[object]:
+        if not body:
+            return body
+        if result_name and len(body) >= 2:
+            penultimate = body[-2]
+            last = body[-1]
+            if (
+                isinstance(penultimate, If)
+                and not penultimate.orelse
+                and len(penultimate.body) == 1
+                and isinstance(penultimate.body[0], Return)
+                and penultimate.body[0].value is not None
+                and isinstance(last, Return)
+                and last.value is not None
+            ):
+                return [
+                    *body[:-2],
+                    If(
+                        test=penultimate.test,
+                        body=[Assignment(ValueRef(result_name), penultimate.body[0].value)],
+                        orelse=[Assignment(ValueRef(result_name), last.value)],
+                    ),
+                ]
+        last = body[-1]
+        if isinstance(last, Return) and last.value is None:
+            return body[:-1]
+        if isinstance(last, Return) and last.value is not None and result_name:
+            return [*body[:-1], Assignment(ValueRef(result_name), last.value)]
+        return body
+
+    def _emit_one_line_if(self, test: object, stmt: object, result_name: str) -> str | None:
+        if isinstance(stmt, Assignment):
+            return f"if ({self._emit_expr(test)}) {stmt.target.name} = {self._emit_expr(stmt.value)}"
+        if isinstance(stmt, AugmentedAssignment):
+            value = self._emit_expr(stmt.value)
+            return f"if ({self._emit_expr(test)}) {stmt.target.name} = {stmt.target.name} {stmt.op.value} {value}"
+        if isinstance(stmt, ExprStatement) and isinstance(stmt.expr, Call):
+            if stmt.expr.func == "ac_fill_slice":
+                array_expr, start_expr, stop_expr, value_expr = stmt.expr.args
+                base = self._emit_expr(array_expr)
+                start_text = self._emit_expr(start_expr)
+                stop_text = self._emit_expr(stop_expr)
+                value_text = self._emit_expr(value_expr)
+                return f"if ({self._emit_expr(test)}) {base}(({start_text}) + 1:{stop_text}) = {value_text}"
+            args = ", ".join(self._emit_expr(arg) for arg in stmt.expr.args)
+            return f"if ({self._emit_expr(test)}) call {stmt.expr.func}({args})"
+        if isinstance(stmt, Print):
+            if not stmt.values:
+                return 'if (' + self._emit_expr(test) + ') print *'
+            args = ", ".join(self._emit_expr(value) for value in stmt.values)
+            return f"if ({self._emit_expr(test)}) print *, {args}"
+        if isinstance(stmt, Raise):
+            return f"if ({self._emit_expr(test)}) error stop {self._emit_string(stmt.message)}"
+        if isinstance(stmt, Return):
+            if stmt.value is None:
+                return "if (" + self._emit_expr(test) + ") return"
+            if result_name:
+                return None
+        return None
+
+    def _procedure_attrs(self, fn: Function) -> str:
+        if self._is_elemental(fn):
+            return "pure elemental"
+        if self._is_pure(fn):
+            return "pure"
+        return ""
+
+    def _is_elemental(self, fn: Function) -> bool:
+        if fn.result_type is None:
+            return False
+        if isinstance(fn.result_type, (ArrayTypeRef, RecordTypeRef)):
+            return False
+        if any(isinstance(arg_type, (ArrayTypeRef, RecordTypeRef)) for _, arg_type in fn.args):
+            return False
+        if any(self._stmt_uses_impurity(stmt) for stmt in fn.body):
+            return False
+        return True
+
+    def _is_pure(self, fn: Function) -> bool:
+        if any(self._stmt_uses_impurity(stmt) for stmt in fn.body):
+            return False
+        return True
+
+    def _stmt_uses_impurity(self, stmt: object) -> bool:
+        if isinstance(stmt, (Print, Raise, Append, Continue, Pass)):
+            return isinstance(stmt, (Print, Append))
+        if isinstance(stmt, ExprStatement):
+            return self._expr_uses_impurity(stmt.expr)
+        if isinstance(stmt, Assignment):
+            return self._expr_uses_impurity(stmt.value)
+        if isinstance(stmt, IndexAssignment):
+            return self._expr_uses_impurity(stmt.target) or self._expr_uses_impurity(stmt.index) or self._expr_uses_impurity(stmt.value)
+        if isinstance(stmt, FieldAssignment):
+            return self._expr_uses_impurity(stmt.target) or self._expr_uses_impurity(stmt.value)
+        if isinstance(stmt, AugmentedAssignment):
+            return self._expr_uses_impurity(stmt.value)
+        if isinstance(stmt, Return):
+            return stmt.value is not None and self._expr_uses_impurity(stmt.value)
+        if isinstance(stmt, If):
+            return (
+                self._expr_uses_impurity(stmt.test)
+                or any(self._stmt_uses_impurity(inner) for inner in stmt.body)
+                or any(self._stmt_uses_impurity(inner) for inner in stmt.orelse)
+            )
+        if isinstance(stmt, ForRange):
+            return (
+                (stmt.start is not None and self._expr_uses_impurity(stmt.start))
+                or self._expr_uses_impurity(stmt.stop)
+                or (stmt.step is not None and self._expr_uses_impurity(stmt.step))
+                or any(self._stmt_uses_impurity(inner) for inner in stmt.body)
+            )
+        return False
+
+    def _emit_index_selector(self, expr: object) -> str | None:
+        match = self._match_reverse_range(expr)
+        if match is None:
+            return None
+        high_expr, stop_expr = match
+        high_text = self._emit_expr(high_expr)
+        stop_text = self._emit_expr(stop_expr)
+        return f"{high_text}:{high_text} - ({stop_text}) + 2:-1"
+
+    def _match_reverse_range(self, expr: object) -> tuple[object, object] | None:
+        if not (
+            isinstance(expr, BinaryOp)
+            and expr.op == BinaryOperator.SUB
+        ):
+            return None
+        if not (
+            isinstance(expr.right, Call)
+            and expr.right.func == "ac_arange_int"
+            and len(expr.right.args) == 2
+            and isinstance(expr.right.args[0], Constant)
+            and expr.right.args[0].value == 1
+        ):
+            return None
+        return expr.left, expr.right.args[1]
+
+    def _expr_uses_impurity(self, expr: object) -> bool:
+        if isinstance(expr, Call):
+            if expr.func in {"ac_random_init", "ac_gauss", "ac_choice_weighted", "ac_choice_no_replace", "ac_loadtxt", "ac_savetxt", "ac_fill_slice"}:
+                return True
+            return any(self._expr_uses_impurity(arg) for arg in expr.args)
+        if hasattr(expr, "__dataclass_fields__"):
+            return any(self._expr_uses_impurity(getattr(expr, name)) for name in expr.__dataclass_fields__)
+        if isinstance(expr, (list, tuple, set)):
+            return any(self._expr_uses_impurity(item) for item in expr)
+        return False
+
     def _required_helpers(self, module: Module) -> set[str]:
         helper_keys: set[str] = set()
 
         def visit(value: object) -> None:
-            if isinstance(value, Call) and value.func in {"ac_random_init", "ac_gauss"}:
+            if isinstance(value, Call) and value.func in {
+                "ac_lower",
+                "ac_format_default",
+                "ac_format_fixed",
+                "ac_format_scientific",
+                "ac_format_int",
+                "ac_format_array",
+                "ac_set_printoptions",
+            }:
+                helper_keys.add("ac_string")
+            elif isinstance(value, Call) and value.func in {"ac_random_init", "ac_gauss"}:
                 helper_keys.add("ac_random")
             elif isinstance(value, Call) and value.func in AC_NUMPY_FUNCS:
                 helper_keys.add("ac_numpy")
@@ -478,6 +790,180 @@ class FortranBackend:
 
         visit(module)
         return helper_keys
+
+    def _render_print_value(self, expr: object) -> tuple[str, bool]:
+        if isinstance(expr, Constant) and isinstance(expr.value, str):
+            return self._emit_string(expr.value), True
+        if isinstance(expr, Call) and expr.func in {
+            "ac_lower",
+            "trim",
+            "adjustl",
+            "ac_format_default",
+            "ac_format_fixed",
+            "ac_format_scientific",
+            "ac_format_int",
+            "ac_format_array",
+        }:
+            return self._emit_expr(expr), True
+
+        expr_type = self._expr_type(expr)
+        if expr_type == ScalarType.STRING:
+            return self._emit_expr(expr), True
+        if expr_type == ScalarType.INTEGER:
+            return f"ac_format_int({self._emit_expr(expr)}, 0)", True
+        if expr_type in {ScalarType.REAL64, ScalarType.LOGICAL}:
+            return f"ac_format_default({self._emit_expr(expr)})", True
+        if isinstance(expr_type, ArrayTypeRef) and expr_type.rank == 1 and expr_type.element_type == ScalarType.REAL64:
+            return f"ac_format_array({self._emit_expr(expr)})", True
+        return self._emit_expr(expr), False
+
+    def _expr_type(self, expr: object) -> object | None:
+        if isinstance(expr, ValueRef):
+            return self._current_symbols.get(expr.name)
+        if isinstance(expr, Constant):
+            if isinstance(expr.value, bool):
+                return ScalarType.LOGICAL
+            if isinstance(expr.value, int):
+                return ScalarType.INTEGER
+            if isinstance(expr.value, float):
+                return ScalarType.REAL64
+            if isinstance(expr.value, str):
+                return ScalarType.STRING
+        if isinstance(expr, FieldAccess):
+            base_type = self._expr_type(expr.value)
+            if isinstance(base_type, RecordTypeRef):
+                record = self._record_types.get(base_type.name)
+                if record is not None:
+                    for field_name, field_type in record.fields:
+                        if field_name == expr.field:
+                            return field_type
+        if isinstance(expr, IndexAccess):
+            base_type = self._expr_type(expr.value)
+            if isinstance(base_type, ArrayTypeRef):
+                return base_type.element_type
+        if isinstance(expr, UnaryOp):
+            return self._expr_type(expr.operand)
+        if isinstance(expr, BinaryOp):
+            left_type = self._expr_type(expr.left)
+            right_type = self._expr_type(expr.right)
+            if isinstance(left_type, ArrayTypeRef):
+                return left_type
+            if isinstance(right_type, ArrayTypeRef):
+                return right_type
+            if left_type == ScalarType.INTEGER and right_type == ScalarType.INTEGER:
+                return ScalarType.INTEGER
+            return ScalarType.REAL64
+        if isinstance(expr, (Compare, BooleanOp)):
+            return ScalarType.LOGICAL
+        if isinstance(expr, Call):
+            if expr.func in self._function_results:
+                return self._function_results[expr.func]
+            if expr.func in {"ac_lower", "trim", "adjustl", "ac_format_default", "ac_format_fixed", "ac_format_scientific", "ac_format_int", "ac_format_array"}:
+                return ScalarType.STRING
+            if expr.func in {"size", "ac_ndim", "ac_shape_dim", "int"}:
+                return ScalarType.INTEGER
+            if expr.func in {"float", "ac_float", "abs", "min", "max", "sum", "sin", "cos", "sqrt", "exp", "log"}:
+                return ScalarType.REAL64
+            if expr.func in {
+                "ac_array",
+                "ac_asarray",
+                "ac_reverse",
+                "ac_r_concat",
+                "ac_zeros",
+                "ac_arange",
+                "ac_arange_int",
+                "ac_column_stack",
+                "ac_round",
+                "ac_slice",
+                "ac_set_slice",
+                "ac_take_rows",
+                "ac_row",
+                "ac_column",
+                "ac_add_axis",
+                "ac_copy",
+                "ac_full",
+                "ac_where",
+                "ac_argsort",
+                "ac_roots",
+                "ac_normal_vec",
+            }:
+                first_type = self._expr_type(expr.args[0]) if expr.args else None
+                if expr.func == "ac_row" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, max(1, first_type.rank - 1))
+                if expr.func == "ac_column" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func == "ac_add_axis" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, first_type.rank + 1)
+                if expr.func == "ac_roots":
+                    return ArrayTypeRef(ScalarType.COMPLEX128, 1)
+                if expr.func in {"ac_where", "ac_argsort"}:
+                    return ArrayTypeRef(ScalarType.INTEGER, 1)
+                if expr.func == "ac_arange_int":
+                    return ArrayTypeRef(ScalarType.INTEGER, 1)
+                if expr.func == "ac_column_stack":
+                    return ArrayTypeRef(ScalarType.REAL64, 2)
+                if isinstance(first_type, ArrayTypeRef):
+                    return first_type
+            if expr.func in {
+                "ac_empty",
+                "ac_empty2",
+                "ac_zeros2",
+                "ac_matmul",
+                "ac_transpose",
+                "ac_atleast_2d",
+                "ac_inv",
+                "ac_cov_rowvar_false",
+                "ac_multivariate_normal",
+                "ac_loadtxt",
+                "ac_set_rows",
+                "ac_set_row",
+                "ac_set_column",
+                "ac_sub_col",
+                "ac_mul_col",
+                "ac_solve_linear",
+            }:
+                if expr.func in {
+                    "ac_empty2",
+                    "ac_zeros2",
+                    "ac_matmul",
+                    "ac_transpose",
+                    "ac_atleast_2d",
+                    "ac_inv",
+                    "ac_cov_rowvar_false",
+                    "ac_loadtxt",
+                    "ac_sub_col",
+                    "ac_mul_col",
+                }:
+                    return ArrayTypeRef(ScalarType.REAL64, 2)
+                if expr.func in {"ac_empty", "ac_multivariate_normal", "ac_solve_linear"}:
+                    return ArrayTypeRef(ScalarType.REAL64, 1)
+        return None
+
+    def _join_rendered_print_values(
+        self,
+        original_values: tuple[object, ...],
+        rendered: list[tuple[str, bool]],
+    ) -> str:
+        parts: list[str] = []
+        for index, ((text, _), original) in enumerate(zip(rendered, original_values, strict=True)):
+            if index > 0 and self._needs_print_separator(original_values[index - 1], original):
+                parts.append(self._emit_string(" "))
+            parts.append(text)
+        return " // ".join(parts)
+
+    def _needs_print_separator(self, left: object, right: object) -> bool:
+        left_text = self._literal_string_value(left)
+        right_text = self._literal_string_value(right)
+        if left_text is not None and left_text.endswith((" ", "\t", "\n")):
+            return False
+        if right_text is not None and right_text.startswith((" ", "\t", "\n", ",", "]", ")")):
+            return False
+        return True
+
+    def _literal_string_value(self, expr: object) -> str | None:
+        if isinstance(expr, Constant) and isinstance(expr.value, str):
+            return expr.value
+        return None
 
     def _export_names(self, module: Module) -> list[str]:
         if module.exports:

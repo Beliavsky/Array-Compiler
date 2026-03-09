@@ -57,7 +57,7 @@ class FortranBindCGenerator:
         wrapper_lines.append("")
 
         return BindCArtifact(
-            source=wrap_fortran_source("\n".join(wrapper_lines), max_len=132),
+            source=wrap_fortran_source("\n".join(wrapper_lines), max_len=80),
             exported_wrappers=exported_wrappers,
             skipped_exports=skipped_exports,
             diagnostics=diagnostics,

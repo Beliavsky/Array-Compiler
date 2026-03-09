@@ -1,0 +1,26 @@
+Every module should have implicit none. Contained procedures will not
+then have implicit none, since it is redundant.
+
+Do not have "return" just before the end of a procedure or main program, 
+since it is redundant.
+
+Declare procedures are pure elemental when possible. If a procedure is not
+pure elemental but is pure, declare it pure.
+
+Use continuation lines after 80 characters.
+
+Coalesce like declarations unless there are inline comments for them.
+
+Use double quotes rather than single quotes when possible.
+
+Avoid redundant parentheses, for example in
+if ((spot <= 0.0d0)) then
+
+Use one-line if statements instead of if blocks when possible.
+
+Make any variable which can be (does not change after being set) a named 
+constant when possible.
+
+Static helper functions should have a brief comment below the signature
+explaining what they do and inline comments explaining the meaning of each
+argument.
