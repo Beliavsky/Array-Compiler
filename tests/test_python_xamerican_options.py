@@ -21,8 +21,8 @@ def test_xamerican_options_lowers_and_emits_fortran() -> None:
     assert "values = [real(dp) :: ]" in source
     assert "values = [values, max(terminal_price - strike, 0.0d0)]" in source
     assert "do step = num_steps - 1, merge((-1 - 1), (-1 + 1), (-1 > 0)), -1" in source
-    assert "continuation_value = discount * ((risk_neutral_prob * values(node + 1) &" in source
-    assert "& ) + ((1.0d0 - risk_neutral_prob) * values(node + 1 + 1)))" in source
+    assert "continuation_value = discount * (risk_neutral_prob * values(node + 1) &" in source
+    assert "& + (1.0d0 - risk_neutral_prob) * values(node + 2))" in source
     assert "call print_example(0.0d0)" in source
     assert "print *" in source
     assert "call print_example(0.08d0)" in source

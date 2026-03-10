@@ -7,6 +7,8 @@ structured return values suitable for option-pricing examples.
 from __future__ import annotations
 
 import ast
+import io
+import tokenize
 from dataclasses import dataclass, field
 
 from ...ir.module import Module
@@ -18,7 +20,9 @@ from ...ir.nodes import (
     BinaryOp,
     BinaryOperator,
     BooleanOp,
+    Break,
     Call,
+    Comment,
     ConditionalExpr,
     Compare,
     CompareOperator,
@@ -44,6 +48,7 @@ from ...ir.nodes import (
     UnaryOp,
     UnaryOperator,
     ValueRef,
+    While,
 )
 
 
@@ -56,10 +61,17 @@ class PythonNumpyFrontend:
     _record_defs: dict[str, RecordDef] = field(default_factory=dict, init=False)
     _current_function: str | None = field(default=None, init=False)
     _current_symbols: dict[str, object] = field(default_factory=dict, init=False)
+    _current_dtypes: dict[str, str] = field(default_factory=dict, init=False)
+    _source_lines: list[str] = field(default_factory=list, init=False)
+    _comment_lines: dict[int, str] = field(default_factory=dict, init=False)
+    _used_comment_lines: set[int] = field(default_factory=set, init=False)
 
     def lower_source(self, source: str, module_name: str = "translated_module") -> Module:
         if source.startswith("\ufeff"):
             source = source.lstrip("\ufeff")
+        self._source_lines = source.splitlines()
+        self._comment_lines = self._extract_comment_lines(source)
+        self._used_comment_lines = set()
         tree = ast.parse(source)
         self._function_result_types = {}
         self._function_arg_defaults = {}
@@ -68,6 +80,7 @@ class PythonNumpyFrontend:
         self._record_defs = {}
         self._current_function = None
         self._current_symbols = {}
+        self._current_dtypes = {}
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -99,16 +112,23 @@ class PythonNumpyFrontend:
     def _lower_program(self, preamble_stmts: list[ast.stmt], main_guard: ast.If | None) -> Program:
         locals_map: dict[str, object] = {}
         body: list[object] = []
+        leading_comments: list[str] = []
+        if preamble_stmts:
+            leading_comments = self._leading_comments_after_line(0, preamble_stmts[0].lineno)
         for stmt in preamble_stmts:
             if self._is_docstring(stmt):
                 continue
             self._collect_locals(stmt, locals_map)
-            body.append(self._lower_stmt(stmt))
+            body.extend(Comment(text) for text in self._attached_comments_before_stmt(stmt, 0))
+            body.extend(self._lower_stmt_list(stmt))
         if main_guard is not None:
+            if not leading_comments and main_guard.body:
+                leading_comments = self._leading_comments_after_line(main_guard.lineno, main_guard.body[0].lineno)
             for stmt in main_guard.body:
                 self._collect_locals(stmt, locals_map)
-                body.append(self._lower_stmt(stmt))
-        return Program(name="run_main", locals=list(locals_map.items()), body=body)
+                body.extend(Comment(text) for text in self._attached_comments_before_stmt(stmt, main_guard.lineno))
+                body.extend(self._lower_stmt_list(stmt))
+        return Program(name="run_main", locals=list(locals_map.items()), body=body, leading_comments=leading_comments)
 
     def _register_function_signature(self, node: ast.FunctionDef) -> None:
         result_type = self._map_annotation(node.returns, node.name)
@@ -143,12 +163,19 @@ class PythonNumpyFrontend:
         self._function_arg_types[node.name] = [arg_type for _, arg_type in args]
         self._update_function_defaults(node, dict(args))
         self._current_symbols = {name: typ for name, typ in args}
+        self._current_dtypes = {}
         for stmt in node.body:
             self._collect_locals(stmt, locals_map)
         arg_names = {name for name, _ in args}
         locals_list = [(name, typ) for name, typ in locals_map.items() if name not in arg_names]
         self._current_symbols.update(locals_list)
-        body = [self._lower_stmt(stmt) for stmt in node.body if not self._is_docstring(stmt)]
+        body: list[object] = []
+        leading_comments = self._function_leading_comments(node)
+        for stmt in node.body:
+            if self._is_docstring(stmt):
+                continue
+            body.extend(Comment(text) for text in self._attached_comments_before_stmt(stmt, node.lineno))
+            body.extend(self._lower_stmt_list(stmt))
         result_type = self._refine_function_result_type(node.name, body)
         if result_type is not None:
             self._function_result_types[node.name] = result_type
@@ -158,9 +185,11 @@ class PythonNumpyFrontend:
             locals=locals_list,
             body=body,
             result_type=result_type,
+            leading_comments=leading_comments,
         )
         self._current_function = None
         self._current_symbols = {}
+        self._current_dtypes = {}
         return function
 
     def _update_function_defaults(self, node: ast.FunctionDef, arg_types: dict[str, object]) -> None:
@@ -174,6 +203,12 @@ class PythonNumpyFrontend:
                     if isinstance(arg_type, ArrayTypeRef):
                         defaults[idx] = Call("ac_zeros", (Constant(0),))
                         continue
+                    if arg_type == ScalarType.INTEGER:
+                        defaults[idx] = Constant(-1)
+                        continue
+                    if isinstance(arg_type, RecordTypeRef) and arg_type.name == "ac_random_state":
+                        defaults[idx] = Call("ac_random_init", ())
+                        continue
                 defaults[idx] = self._lower_expr(default)
         self._function_arg_defaults[node.name] = defaults
 
@@ -181,13 +216,89 @@ class PythonNumpyFrontend:
         locals_map: dict[str, object] = {}
         for stmt in node.body:
             self._collect_locals(stmt, locals_map)
-        body = [self._lower_stmt(stmt) for stmt in node.body]
-        return Program(name="run_main", locals=list(locals_map.items()), body=body)
+        body: list[object] = []
+        leading_comments = self._leading_comments_after_line(node.lineno, node.body[0].lineno) if node.body else []
+        for stmt in node.body:
+            body.extend(Comment(text) for text in self._attached_comments_before_stmt(stmt, node.lineno))
+            body.extend(self._lower_stmt_list(stmt))
+        return Program(name="run_main", locals=list(locals_map.items()), body=body, leading_comments=leading_comments)
+
+    def _extract_comment_lines(self, source: str) -> dict[int, str]:
+        comments: dict[int, str] = {}
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                text = token.string[1:].strip()
+                comments[token.start[0]] = text
+        return comments
+
+    def _line_text(self, lineno: int) -> str:
+        if 1 <= lineno <= len(self._source_lines):
+            return self._source_lines[lineno - 1]
+        return ""
+
+    def _leading_comments_after_line(self, start_line: int, first_stmt_line: int) -> list[str]:
+        comments: list[str] = []
+        line = start_line + 1
+        while line < first_stmt_line:
+            stripped = self._line_text(line).strip()
+            if not stripped:
+                line += 1
+                continue
+            if line in self._comment_lines:
+                comments.append(self._comment_lines[line])
+                self._used_comment_lines.add(line)
+                line += 1
+                continue
+            break
+        return comments
+
+    def _function_leading_comments(self, node: ast.FunctionDef) -> list[str]:
+        first_stmt_line = node.body[0].lineno if node.body else node.lineno + 1
+        comments = self._leading_comments_after_line(node.lineno, first_stmt_line)
+        docstring_lines = self._function_docstring_lines(node)
+        if docstring_lines:
+            comments.extend(docstring_lines)
+        return comments
+
+    def _function_docstring_lines(self, node: ast.FunctionDef) -> list[str]:
+        if not node.body:
+            return []
+        first_stmt = node.body[0]
+        if (
+            isinstance(first_stmt, ast.Expr)
+            and isinstance(first_stmt.value, ast.Constant)
+            and isinstance(first_stmt.value.value, str)
+        ):
+            return [line.rstrip() for line in first_stmt.value.value.strip().splitlines() if line.strip()]
+        return []
+
+    def _attached_comments_before_stmt(self, stmt: ast.stmt, lower_bound_line: int) -> list[str]:
+        line = stmt.lineno - 1
+        comments: list[str] = []
+        while line > lower_bound_line:
+            stripped = self._line_text(line).strip()
+            if not stripped:
+                line -= 1
+                continue
+            if line in self._comment_lines and line not in self._used_comment_lines:
+                comments.append(self._comment_lines[line])
+                line -= 1
+                continue
+            break
+        comments.reverse()
+        self._used_comment_lines.update(
+            stmt.lineno - offset
+            for offset in range(1, stmt.lineno - line)
+            if (stmt.lineno - offset) in self._comment_lines
+        )
+        return comments
 
     def _refine_arg_types(self, node: ast.FunctionDef) -> dict[str, object]:
         arg_types: dict[str, object] = {}
         aliases: dict[str, str] = {}
         integer_like_names: set[str] = set()
+        local_types: dict[str, object] = {}
+        sequence_like_names: set[str] = set()
 
         for arg, default in zip(node.args.args, [None] * (len(node.args.args) - len(node.args.defaults)) + list(node.args.defaults), strict=True):
             annotated = self._map_annotation(arg.annotation, node.name)
@@ -195,6 +306,8 @@ class PythonNumpyFrontend:
                 arg_types[arg.arg] = annotated
             elif isinstance(default, ast.Constant) and isinstance(default.value, int):
                 arg_types[arg.arg] = ScalarType.INTEGER
+            elif isinstance(default, ast.Constant) and isinstance(default.value, float):
+                arg_types[arg.arg] = ScalarType.REAL64
 
         for stmt in ast.walk(node):
             if (
@@ -208,30 +321,51 @@ class PythonNumpyFrontend:
                         if arg_types.get(arg.id) != ScalarType.STRING:
                             arg_types[arg.id] = ScalarType.STRING
             if isinstance(stmt, ast.Call):
+                if isinstance(stmt.func, ast.Name) and stmt.func.id == "len" and stmt.args and isinstance(stmt.args[0], ast.Name):
+                    self._merge_arg_type(arg_types, stmt.args[0].id, ArrayTypeRef(ScalarType.REAL64, 1))
+                    sequence_like_names.add(stmt.args[0].id)
                 if isinstance(stmt.func, ast.Name) and stmt.func.id == "range":
                     for arg in stmt.args:
-                        if isinstance(arg, ast.Name):
-                            integer_like_names.add(arg.id)
+                        self._collect_integer_like_names(arg, integer_like_names)
                 if isinstance(stmt.func, ast.Attribute):
                     chain = self._attr_chain(stmt.func)
+                    if chain == ["np", "asarray"] and stmt.args and isinstance(stmt.args[0], ast.Name):
+                        self._merge_arg_type(arg_types, stmt.args[0].id, ArrayTypeRef(ScalarType.REAL64, 1))
+                        sequence_like_names.add(stmt.args[0].id)
                     if stmt.func.attr == "normal" and chain[:1] != ["np"]:
                         size_expr = self._keyword_value(stmt, "size")
-                        if isinstance(size_expr, ast.Name):
-                            integer_like_names.add(size_expr.id)
+                        if size_expr is not None:
+                            self._collect_integer_like_names(size_expr, integer_like_names)
                     if chain in (["np", "zeros"], ["np", "empty"], ["np", "full"]) and stmt.args:
-                        if isinstance(stmt.args[0], ast.Name):
-                            integer_like_names.add(stmt.args[0].id)
+                        self._collect_integer_like_names(stmt.args[0], integer_like_names)
                         if isinstance(stmt.args[0], ast.Tuple):
                             for elt in stmt.args[0].elts:
-                                if isinstance(elt, ast.Name):
-                                    integer_like_names.add(elt.id)
+                                self._collect_integer_like_names(elt, integer_like_names)
             if isinstance(stmt, ast.Subscript):
+                if isinstance(stmt.value, ast.Name) and stmt.value.id in {item.arg for item in node.args.args}:
+                    if isinstance(stmt.slice, ast.Slice):
+                        self._merge_arg_type(arg_types, stmt.value.id, ArrayTypeRef(ScalarType.REAL64, 1))
+                        sequence_like_names.add(stmt.value.id)
+                    elif not isinstance(stmt.slice, ast.Tuple):
+                        self._merge_arg_type(arg_types, stmt.value.id, ArrayTypeRef(ScalarType.REAL64, 1))
+                        sequence_like_names.add(stmt.value.id)
                 if isinstance(stmt.slice, ast.Name):
                     integer_like_names.add(stmt.slice.id)
+                elif isinstance(stmt.slice, ast.Slice):
+                    for part in (stmt.slice.lower, stmt.slice.upper, stmt.slice.step):
+                        if part is not None:
+                            self._collect_integer_like_names(part, integer_like_names)
                 elif isinstance(stmt.slice, ast.Tuple):
                     for elt in stmt.slice.elts:
                         if isinstance(elt, ast.Name):
                             integer_like_names.add(elt.id)
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                try:
+                    inferred_local = self._infer_type(stmt.value)
+                except Exception:
+                    inferred_local = None
+                if inferred_local is not None:
+                    local_types[stmt.targets[0].id] = inferred_local
             if (
                 isinstance(stmt, ast.For)
                 and isinstance(stmt.iter, ast.Name)
@@ -239,6 +373,34 @@ class PythonNumpyFrontend:
             ):
                 if self._merge_arg_type(arg_types, stmt.iter.id, ArrayTypeRef(ScalarType.REAL64, 2)):
                     pass
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                if (
+                    isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute)
+                    and self._attr_chain(stmt.value.func) == ["np", "random", "default_rng"]
+                    and stmt.targets[0].id in {item.arg for item in node.args.args}
+                ):
+                    arg_types[stmt.targets[0].id] = RecordTypeRef("ac_random_state")
+            if isinstance(stmt, ast.Compare):
+                names: list[str] = []
+                if isinstance(stmt.left, ast.Name):
+                    names.append(stmt.left.id)
+                for comparator in stmt.comparators:
+                    if isinstance(comparator, ast.Name):
+                        names.append(comparator.id)
+                compare_nodes = [stmt.left, *stmt.comparators]
+                if any(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in compare_nodes) or any(
+                    isinstance(item, (ast.Tuple, ast.List, ast.Set))
+                    and any(isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in item.elts)
+                    for item in compare_nodes
+                ):
+                    for name in names:
+                        if name in {item.arg for item in node.args.args}:
+                            arg_types[name] = ScalarType.STRING
+
+        for arg in node.args.args:
+            if arg.arg in integer_like_names and arg_types.get(arg.arg) != ScalarType.STRING:
+                arg_types[arg.arg] = ScalarType.INTEGER
 
         changed = True
         while changed:
@@ -267,6 +429,14 @@ class PythonNumpyFrontend:
                         if self._set_array_rank(arg_types, aliases, stmt.value.args[0].id, 1):
                             changed = True
                         if self._set_array_rank(arg_types, aliases, target_name, 1):
+                            changed = True
+                    if (
+                        isinstance(stmt.value, ast.Call)
+                        and isinstance(stmt.value.func, ast.Attribute)
+                        and self._attr_chain(stmt.value.func) == ["np", "random", "default_rng"]
+                    ):
+                        if arg_types.get(target_name) != RecordTypeRef("ac_random_state"):
+                            arg_types[target_name] = RecordTypeRef("ac_random_state")
                             changed = True
                 if isinstance(stmt, ast.Attribute) and isinstance(stmt.value, ast.Name):
                     if stmt.attr == "ndim":
@@ -304,6 +474,21 @@ class PythonNumpyFrontend:
                         if isinstance(arg, ast.Name) and arg_types.get(arg.id) != ScalarType.INTEGER:
                             arg_types[arg.id] = ScalarType.INTEGER
                             changed = True
+                if isinstance(stmt, ast.BinOp):
+                    left_type = self._infer_type(stmt.left)
+                    right_type = self._infer_type(stmt.right)
+                    if isinstance(stmt.left, ast.Name) and stmt.left.id in local_types:
+                        left_type = local_types[stmt.left.id]
+                    if isinstance(stmt.right, ast.Name) and stmt.right.id in local_types:
+                        right_type = local_types[stmt.right.id]
+                    if isinstance(stmt.left, ast.Name) and isinstance(right_type, ArrayTypeRef):
+                        current_type = arg_types.get(stmt.left.id)
+                        if current_type is None or isinstance(current_type, ArrayTypeRef):
+                            changed |= self._merge_arg_type(arg_types, stmt.left.id, ArrayTypeRef(right_type.element_type, right_type.rank))
+                    if isinstance(stmt.right, ast.Name) and isinstance(left_type, ArrayTypeRef):
+                        current_type = arg_types.get(stmt.right.id)
+                        if current_type is None or isinstance(current_type, ArrayTypeRef):
+                            changed |= self._merge_arg_type(arg_types, stmt.right.id, ArrayTypeRef(left_type.element_type, left_type.rank))
                 if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                     if stmt.targets[0].id in integer_like_names:
                         changed |= self._mark_integer_names(arg_types, stmt.value)
@@ -312,6 +497,17 @@ class PythonNumpyFrontend:
                     for actual_arg, expected_type in zip(stmt.args, expected_types, strict=False):
                         if isinstance(actual_arg, ast.Name):
                             changed |= self._merge_arg_type(arg_types, actual_arg.id, expected_type)
+                    arg_names = self._function_arg_names.get(stmt.func.id, [])
+                    expected_by_name = {
+                        name: expected_type
+                        for name, expected_type in zip(arg_names, expected_types, strict=False)
+                    }
+                    for keyword in stmt.keywords:
+                        if keyword.arg is None or not isinstance(keyword.value, ast.Name):
+                            continue
+                        expected_type = expected_by_name.get(keyword.arg)
+                        if expected_type is not None:
+                            changed |= self._merge_arg_type(arg_types, keyword.value.id, expected_type)
         return arg_types
 
     def _mark_integer_names(self, arg_types: dict[str, object], expr: ast.AST) -> bool:
@@ -330,6 +526,21 @@ class PythonNumpyFrontend:
             if isinstance(expr.func, ast.Name) and expr.func.id == "abs" and expr.args:
                 changed |= self._mark_integer_names(arg_types, expr.args[0])
         return changed
+
+    def _collect_integer_like_names(self, expr: ast.AST, names: set[str]) -> None:
+        if isinstance(expr, ast.Name):
+            names.add(expr.id)
+            return
+        if isinstance(expr, ast.BinOp):
+            self._collect_integer_like_names(expr.left, names)
+            self._collect_integer_like_names(expr.right, names)
+            return
+        if isinstance(expr, ast.UnaryOp):
+            self._collect_integer_like_names(expr.operand, names)
+            return
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id in {"len", "int", "size", "abs", "max", "min"}:
+            for arg in expr.args:
+                self._collect_integer_like_names(arg, names)
 
     def _merge_arg_type(self, arg_types: dict[str, object], name: str, new_type: object) -> bool:
         current = arg_types.get(name)
@@ -426,6 +637,24 @@ class PythonNumpyFrontend:
                 return ScalarType.REAL64
             if expr.func == "all":
                 return ScalarType.LOGICAL
+        if isinstance(expr, BinaryOp):
+            left_type = self._infer_ir_type(expr.left)
+            right_type = self._infer_ir_type(expr.right)
+            if isinstance(left_type, ArrayTypeRef) or isinstance(right_type, ArrayTypeRef):
+                return self._combine_array_types(left_type, right_type)
+            if left_type == ScalarType.INTEGER and right_type == ScalarType.INTEGER:
+                return ScalarType.INTEGER
+            return ScalarType.REAL64
+        if isinstance(expr, UnaryOp):
+            return ScalarType.LOGICAL if expr.op == UnaryOperator.NOT else self._infer_ir_type(expr.operand)
+        if isinstance(expr, IndexAccess):
+            container_type = self._infer_ir_type(expr.value)
+            if isinstance(container_type, ArrayTypeRef):
+                if container_type.rank <= 1:
+                    return container_type.element_type
+                return ArrayTypeRef(container_type.element_type, rank=container_type.rank - 1)
+        if isinstance(expr, ConditionalExpr):
+            return self._merge_types(self._infer_ir_type(expr.if_true), self._infer_ir_type(expr.if_false))
         if isinstance(expr, FieldAccess):
             base_type = self._infer_ir_type(expr.value)
             if isinstance(base_type, RecordTypeRef):
@@ -468,6 +697,11 @@ class PythonNumpyFrontend:
                 loop_name = self._loop_target_name(stmt.target.id)
                 locals_map[loop_name] = ScalarType.INTEGER
                 self._current_symbols[loop_name] = ScalarType.INTEGER
+            elif isinstance(stmt.iter, ast.Tuple):
+                elt_types = [self._infer_type(elt) for elt in stmt.iter.elts]
+                target_type = elt_types[0] if elt_types else ScalarType.REAL64
+                locals_map[stmt.target.id] = self._merge_types(locals_map.get(stmt.target.id), target_type)
+                self._current_symbols[stmt.target.id] = locals_map[stmt.target.id]
             else:
                 iter_type = self._infer_type(stmt.iter)
                 if isinstance(iter_type, ArrayTypeRef):
@@ -486,9 +720,25 @@ class PythonNumpyFrontend:
             for inner in stmt.orelse:
                 self._collect_locals(inner, locals_map)
         elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Tuple):
+            iter_type = self._infer_type(stmt.iter)
+            tuple_item_type = ScalarType.REAL64
+            if isinstance(iter_type, ArrayTypeRef):
+                tuple_item_type = (
+                    ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
+                    if iter_type.rank > 2
+                    else iter_type.element_type
+                )
+                loop_name = self._iter_loop_index_name(self._tuple_source_name(stmt.iter))
+                locals_map[loop_name] = ScalarType.INTEGER
+                self._current_symbols[loop_name] = ScalarType.INTEGER
+                if iter_type.rank > 1:
+                    temp_name = self._tuple_temp_name(self._tuple_source_name(stmt.iter))
+                    temp_type = ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
+                    locals_map[temp_name] = self._merge_types(locals_map.get(temp_name), temp_type)
+                    self._current_symbols[temp_name] = locals_map[temp_name]
             for elt in stmt.target.elts:
                 if isinstance(elt, ast.Name):
-                    locals_map[elt.id] = self._merge_types(locals_map.get(elt.id), ScalarType.REAL64)
+                    locals_map[elt.id] = self._merge_types(locals_map.get(elt.id), tuple_item_type)
                     self._current_symbols[elt.id] = locals_map[elt.id]
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
@@ -499,6 +749,20 @@ class PythonNumpyFrontend:
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
             for inner in stmt.orelse:
+                self._collect_locals(inner, locals_map)
+        elif isinstance(stmt, ast.While):
+            self._collect_expr_locals(stmt.test, locals_map)
+            for inner in stmt.body:
+                self._collect_locals(inner, locals_map)
+        elif isinstance(stmt, ast.Try):
+            for inner in stmt.body:
+                self._collect_locals(inner, locals_map)
+            for handler in stmt.handlers:
+                for inner in handler.body:
+                    self._collect_locals(inner, locals_map)
+            for inner in stmt.orelse:
+                self._collect_locals(inner, locals_map)
+            for inner in stmt.finalbody:
                 self._collect_locals(inner, locals_map)
 
     def _collect_expr_locals(self, expr: ast.AST, locals_map: dict[str, object]) -> None:
@@ -518,8 +782,15 @@ class PythonNumpyFrontend:
             target = stmt.targets[0]
             if self._is_identity_asarray_assignment(stmt):
                 return Pass()
+            if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Constant) and stmt.value.value is None:
+                target_type = self._current_symbols.get(target.id)
+                if isinstance(target_type, ArrayTypeRef) and target_type.rank == 1 and target_type.element_type == ScalarType.REAL64:
+                    return Assignment(ValueRef(target.id), Call("ac_zeros", (Constant(0),)))
             value = self._lower_expr(stmt.value)
             if isinstance(target, ast.Name):
+                dtype_name = self._infer_dtype_name(stmt.value)
+                if dtype_name is not None:
+                    self._current_dtypes[target.id] = dtype_name
                 return Assignment(ValueRef(target.id), value)
             if isinstance(target, ast.Subscript):
                 slice_assign = self._lower_slice_assignment(target, value)
@@ -585,10 +856,13 @@ class PythonNumpyFrontend:
         if isinstance(stmt, ast.If):
             if self._is_sys_argv_if(stmt):
                 return Pass()
+            sentinel_if = self._lower_optional_none_if(stmt)
+            if sentinel_if is not None:
+                return sentinel_if
             return If(
                 test=self._lower_expr(stmt.test),
-                body=tuple(self._lower_stmt(inner) for inner in stmt.body),
-                orelse=tuple(self._lower_stmt(inner) for inner in stmt.orelse),
+                body=tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner)),
+                orelse=tuple(lowered for inner in stmt.orelse for lowered in self._lower_stmt_list(inner)),
             )
         if isinstance(stmt, ast.For):
             if (
@@ -604,33 +878,61 @@ class PythonNumpyFrontend:
                 value_name = stmt.target.elts[1].id
                 iterable_expr = self._lower_expr(stmt.iter.args[0])
                 body = [Assignment(ValueRef(value_name), IndexAccess(iterable_expr, ValueRef(index_name)))]
-                body.extend(self._lower_stmt(inner) for inner in stmt.body)
+                body.extend(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner))
                 return ForRange(
                     target=index_name,
                     start=Constant(0),
                     stop=Call("size", (iterable_expr,)),
                     body=tuple(body),
                 )
-            if not isinstance(stmt.target, ast.Name):
-                raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
             if not isinstance(stmt.iter, ast.Call) or not isinstance(stmt.iter.func, ast.Name) or stmt.iter.func.id != "range":
-                iterable_expr = self._lower_expr(stmt.iter)
-                loop_name = self._iter_loop_index_name(stmt.target.id)
+                if isinstance(stmt.iter, ast.Tuple):
+                    iterable_expr = Call("ac_array_literal", tuple(self._lower_expr(elt) for elt in stmt.iter.elts))
+                else:
+                    iterable_expr = self._lower_expr(stmt.iter)
+                target_name = stmt.target.id if isinstance(stmt.target, ast.Name) else self._tuple_source_name(stmt.iter)
+                loop_name = self._iter_loop_index_name(target_name)
                 body: list[object]
                 iterable_type = self._infer_type(stmt.iter)
                 if isinstance(iterable_type, ArrayTypeRef) and iterable_type.rank > 1:
-                    body = [Assignment(ValueRef(stmt.target.id), Call("ac_row", (iterable_expr, ValueRef(loop_name))))]
+                    body = []
+                    if isinstance(stmt.target, ast.Name):
+                        row_expr = Call("ac_row", (iterable_expr, ValueRef(loop_name)))
+                        body.append(Assignment(ValueRef(stmt.target.id), row_expr))
+                    elif isinstance(stmt.target, ast.Tuple):
+                        for index, elt in enumerate(stmt.target.elts):
+                            if not isinstance(elt, ast.Name):
+                                raise NotImplementedError(f"unsupported loop target: {ast.dump(elt)}")
+                            body.append(
+                                Assignment(
+                                    ValueRef(elt.id),
+                                    Call("ac_item2", (iterable_expr, ValueRef(loop_name), Constant(index))),
+                                )
+                            )
+                    else:
+                        raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
                     stop_expr = Call("ac_shape_dim", (iterable_expr, Constant(1)))
                 else:
-                    body = [Assignment(ValueRef(stmt.target.id), IndexAccess(iterable_expr, ValueRef(loop_name)))]
+                    if isinstance(stmt.target, ast.Name):
+                        body = [Assignment(ValueRef(stmt.target.id), IndexAccess(iterable_expr, ValueRef(loop_name)))]
+                    elif isinstance(stmt.target, ast.Tuple):
+                        body = []
+                        for index, elt in enumerate(stmt.target.elts):
+                            if not isinstance(elt, ast.Name):
+                                raise NotImplementedError(f"unsupported loop target: {ast.dump(elt)}")
+                            body.append(Assignment(ValueRef(elt.id), IndexAccess(IndexAccess(iterable_expr, ValueRef(loop_name)), Constant(index))))
+                    else:
+                        raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
                     stop_expr = Call("size", (iterable_expr,))
-                body.extend(self._lower_stmt(inner) for inner in stmt.body)
+                body.extend(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner))
                 return ForRange(
                     target=loop_name,
                     start=Constant(0),
                     stop=stop_expr,
                     body=tuple(body),
                 )
+            if not isinstance(stmt.target, ast.Name):
+                raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
             if len(stmt.iter.args) not in {1, 2, 3}:
                 raise NotImplementedError("range supports up to three arguments in the current Python frontend slice")
             start = None
@@ -649,8 +951,18 @@ class PythonNumpyFrontend:
                 start=start,
                 stop=stop,
                 step=step,
-                body=tuple(self._lower_stmt(inner) for inner in stmt.body),
+                body=tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner)),
             )
+        if isinstance(stmt, ast.While):
+            return While(
+                test=self._lower_expr(stmt.test),
+                body=tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner)),
+            )
+        if isinstance(stmt, ast.Try):
+            narrowed = self._lower_narrow_try_stmt(stmt)
+            if narrowed is not None:
+                return narrowed
+            raise NotImplementedError(f"unsupported statement: {ast.dump(stmt)}")
         if isinstance(stmt, ast.Raise):
             message = "error"
             if isinstance(stmt.exc, ast.Call) and stmt.exc.args and isinstance(stmt.exc.args[0], ast.Constant):
@@ -658,6 +970,8 @@ class PythonNumpyFrontend:
             return Raise(message)
         if isinstance(stmt, ast.Continue):
             return Continue()
+        if isinstance(stmt, ast.Break):
+            return Break()
         if isinstance(stmt, ast.Pass):
             return Pass()
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
@@ -677,6 +991,108 @@ class PythonNumpyFrontend:
                 return Append(ValueRef(stmt.value.func.value.id), self._lower_expr(stmt.value.args[0]))
             return ExprStatement(self._lower_expr(stmt.value))
         raise NotImplementedError(f"unsupported statement: {ast.dump(stmt)}")
+
+    def _lower_stmt_list(self, stmt: ast.stmt) -> tuple[object, ...]:
+        if isinstance(stmt, ast.For) and not (
+            isinstance(stmt.iter, ast.Call) and isinstance(stmt.iter.func, ast.Name) and stmt.iter.func.id == "range"
+        ) and isinstance(stmt.iter, ast.Tuple):
+            if not isinstance(stmt.target, ast.Name):
+                raise NotImplementedError(f"unsupported loop target: {ast.dump(stmt.target)}")
+            lowered: list[object] = []
+            for elt in stmt.iter.elts:
+                lowered.append(Assignment(ValueRef(stmt.target.id), self._lower_expr(elt)))
+                for inner in stmt.body:
+                    lowered.extend(self._lower_stmt_list(inner))
+            return tuple(lowered)
+        narrowed_list = self._lower_narrow_try_stmt_list(stmt)
+        if narrowed_list is not None:
+            return narrowed_list
+        return (self._lower_stmt(stmt),)
+
+    def _lower_narrow_try_stmt(self, stmt: ast.Try) -> object | None:
+        lowered_list = self._lower_narrow_try_stmt_list(stmt)
+        if lowered_list is not None and len(lowered_list) == 1:
+            return lowered_list[0]
+        if stmt.orelse or stmt.finalbody or len(stmt.body) != 1 or len(stmt.handlers) != 1:
+            return None
+        body_stmt = stmt.body[0]
+        handler = stmt.handlers[0]
+        if (
+            not isinstance(body_stmt, ast.Assign)
+            or len(body_stmt.targets) != 1
+            or not isinstance(body_stmt.targets[0], ast.Name)
+            or not isinstance(handler.type, ast.Attribute)
+            or self._attr_chain(handler.type) != ["np", "linalg", "LinAlgError"]
+            or len(handler.body) != 1
+            or not isinstance(handler.body[0], ast.Assign)
+            or len(handler.body[0].targets) != 1
+            or not isinstance(handler.body[0].targets[0], ast.Name)
+            or handler.body[0].targets[0].id != body_stmt.targets[0].id
+        ):
+            return None
+        try_call = body_stmt.value
+        except_value = handler.body[0].value
+        if not (
+            isinstance(try_call, ast.Call)
+            and self._attr_chain(try_call.func) == ["np", "linalg", "solve"]
+            and isinstance(except_value, ast.Subscript)
+            and isinstance(except_value.slice, ast.Constant)
+            and except_value.slice.value == 0
+            and isinstance(except_value.value, ast.Call)
+            and self._attr_chain(except_value.value.func) == ["np", "linalg", "lstsq"]
+        ):
+            return None
+        return Assignment(
+            ValueRef(body_stmt.targets[0].id),
+            Call("ac_solve_linear_fallback", tuple(self._lower_expr(arg) for arg in try_call.args)),
+        )
+
+    def _lower_narrow_try_stmt_list(self, stmt: ast.stmt) -> tuple[object, ...] | None:
+        if not isinstance(stmt, ast.Try):
+            return None
+        if stmt.orelse or stmt.finalbody or len(stmt.handlers) != 1:
+            return None
+        handler = stmt.handlers[0]
+        if (
+            isinstance(handler.type, ast.Name)
+            and handler.type.id == "Exception"
+            and len(handler.body) == 1
+            and isinstance(handler.body[0], ast.Return)
+            and handler.body[0].value is not None
+        ):
+            return tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner))
+        return None
+
+    def _lower_optional_none_if(self, stmt: ast.If) -> If | None:
+        test = stmt.test
+        if (
+            not isinstance(test, ast.Compare)
+            or len(test.ops) != 1
+            or len(test.comparators) != 1
+            or not isinstance(test.left, ast.Name)
+            or not isinstance(test.comparators[0], ast.Constant)
+            or test.comparators[0].value is not None
+            or not isinstance(test.ops[0], (ast.Is, ast.IsNot))
+        ):
+            return None
+        left_type = self._current_symbols.get(test.left.id)
+        sentinel: object | None = None
+        if left_type == ScalarType.INTEGER:
+            sentinel = Constant(-1)
+        elif isinstance(left_type, RecordTypeRef) and left_type.name == "ac_random_state":
+            return If(
+                test=Constant(isinstance(test.ops[0], ast.IsNot)),
+                body=tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner)),
+                orelse=tuple(lowered for inner in stmt.orelse for lowered in self._lower_stmt_list(inner)),
+            )
+        if sentinel is None:
+            return None
+        compare_op = CompareOperator.NE if isinstance(test.ops[0], ast.IsNot) else CompareOperator.EQ
+        return If(
+            test=Compare(ValueRef(test.left.id), compare_op, sentinel),
+            body=tuple(lowered for inner in stmt.body for lowered in self._lower_stmt_list(inner)),
+            orelse=tuple(lowered for inner in stmt.orelse for lowered in self._lower_stmt_list(inner)),
+        )
 
     def _lower_numpy_set_printoptions(self, expr: ast.Call) -> object:
         precision = self._keyword_value(expr, "precision")
@@ -842,7 +1258,7 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Tuple):
             record_type = self._function_result_types.get(self._current_function or "")
             if not isinstance(record_type, RecordTypeRef):
-                raise NotImplementedError("tuple literal requires a structured return type")
+                return Call("ac_array_literal", tuple(self._lower_expr(value) for value in expr.elts))
             fields = [(f"item{index}", self._lower_expr(value)) for index, value in enumerate(expr.elts, start=1)]
             typed_fields = [(f"item{index}", self._infer_type(value)) for index, value in enumerate(expr.elts, start=1)]
             self._ensure_record(record_type.name, typed_fields)
@@ -913,6 +1329,8 @@ class PythonNumpyFrontend:
                 ast.LtE: CompareOperator.LE,
                 ast.Gt: CompareOperator.GT,
                 ast.GtE: CompareOperator.GE,
+                ast.Is: CompareOperator.EQ,
+                ast.IsNot: CompareOperator.NE,
             }
             if (
                 len(expr.ops) == 1
@@ -926,26 +1344,52 @@ class PythonNumpyFrontend:
                     CompareOperator.GT if isinstance(expr.ops[0], ast.IsNot) else CompareOperator.EQ,
                     Constant(0),
                 )
+            if (
+                len(expr.ops) == 1
+                and isinstance(expr.comparators[0], ast.Constant)
+                and expr.comparators[0].value is None
+                and isinstance(expr.ops[0], (ast.Is, ast.IsNot))
+                and isinstance(self._infer_type(expr.left), RecordTypeRef)
+                and self._infer_type(expr.left).name == "ac_random_state"
+            ):
+                return Constant(isinstance(expr.ops[0], ast.IsNot))
+            if (
+                len(expr.ops) == 1
+                and isinstance(expr.comparators[0], ast.Constant)
+                and expr.comparators[0].value is None
+                and isinstance(expr.ops[0], (ast.Is, ast.IsNot))
+                and self._infer_type(expr.left) == ScalarType.INTEGER
+            ):
+                return Compare(
+                    self._lower_expr(expr.left),
+                    CompareOperator.NE if isinstance(expr.ops[0], ast.IsNot) else CompareOperator.EQ,
+                    Constant(-1),
+                )
             if len(expr.ops) > 1:
                 left = expr.left
                 comparisons: list[object] = []
                 for op, comparator in zip(expr.ops, expr.comparators, strict=True):
-                    if isinstance(op, ast.NotIn) and isinstance(comparator, ast.Set):
-                        comparisons.extend(
-                            Compare(self._lower_expr(left), CompareOperator.NE, self._lower_expr(elt))
+                    if isinstance(op, (ast.In, ast.NotIn)) and isinstance(comparator, (ast.Set, ast.Tuple, ast.List)):
+                        compare_op = CompareOperator.EQ if isinstance(op, ast.In) else CompareOperator.NE
+                        join_op = "or" if isinstance(op, ast.In) else "and"
+                        terms = tuple(
+                            Compare(self._lower_expr(left), compare_op, self._lower_expr(elt))
                             for elt in comparator.elts
                         )
+                        comparisons.append(BooleanOp(join_op, terms))
                     else:
                         comparisons.append(Compare(self._lower_expr(left), op_map[type(op)], self._lower_expr(comparator)))
                     left = comparator
                 return BooleanOp("and", tuple(comparisons))
             op = expr.ops[0]
-            if isinstance(op, ast.NotIn) and isinstance(expr.comparators[0], ast.Set):
+            if isinstance(op, (ast.In, ast.NotIn)) and isinstance(expr.comparators[0], (ast.Set, ast.Tuple, ast.List)):
+                compare_op = CompareOperator.EQ if isinstance(op, ast.In) else CompareOperator.NE
+                join_op = "or" if isinstance(op, ast.In) else "and"
                 terms = [
-                    Compare(self._lower_expr(expr.left), CompareOperator.NE, self._lower_expr(elt))
+                    Compare(self._lower_expr(expr.left), compare_op, self._lower_expr(elt))
                     for elt in expr.comparators[0].elts
                 ]
-                return BooleanOp("and", tuple(terms))
+                return BooleanOp(join_op, tuple(terms))
             return Compare(self._lower_expr(expr.left), op_map[type(op)], self._lower_expr(expr.comparators[0]))
         if isinstance(expr, ast.BoolOp):
             op = "and" if isinstance(expr.op, ast.And) else "or"
@@ -984,18 +1428,41 @@ class PythonNumpyFrontend:
                     base = self._lower_expr(expr.func.value)
                     size_expr = self._keyword_value(expr, "size")
                     if size_expr is not None:
-                        loc_expr = self._keyword_value(expr, "loc") or Constant(0.0)
-                        scale_expr = self._keyword_value(expr, "scale") or Constant(1.0)
-                        return Call("ac_normal_vec", (base, self._lower_expr(loc_expr), self._lower_expr(scale_expr), self._lower_expr(size_expr)))
+                        loc_ast = self._keyword_value(expr, "loc")
+                        scale_ast = self._keyword_value(expr, "scale")
+                        loc_expr = self._lower_expr(loc_ast) if loc_ast is not None else Constant(0.0)
+                        scale_expr = self._lower_expr(scale_ast) if scale_ast is not None else Constant(1.0)
+                        return Call("ac_normal_vec", (base, loc_expr, scale_expr, self._lower_expr(size_expr)))
                     return Call("ac_gauss", (base, *self._lower_call_args(expr)))
+                if expr.func.attr == "uniform" and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    size_ast = self._keyword_value(expr, "size")
+                    if size_ast is not None:
+                        low_ast = self._keyword_value(expr, "low")
+                        high_ast = self._keyword_value(expr, "high")
+                        low_expr = self._lower_expr(low_ast) if low_ast is not None else Constant(0.0)
+                        high_expr = self._lower_expr(high_ast) if high_ast is not None else Constant(1.0)
+                        return Call("ac_uniform_vec", (base, low_expr, high_expr, self._lower_expr(size_ast)))
                 if expr.func.attr == "sum" and chain[:1] != ["np"]:
                     return Call("sum", (self._lower_expr(expr.func.value),))
                 if expr.func.attr == "mean" and chain[:1] != ["np"]:
                     return Call("ac_mean", (self._lower_expr(expr.func.value),))
                 if expr.func.attr == "copy" and chain[:1] != ["np"]:
                     return Call("ac_copy", (self._lower_expr(expr.func.value),))
+                if expr.func.attr == "astype" and chain[:1] != ["np"]:
+                    return Call("ac_asarray", (self._lower_expr(expr.func.value),))
+                if expr.func.attr in {"ravel", "flatten"} and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    return Call("ac_reshape", (base, Call("size", (base,))))
                 if expr.func.attr == "reshape" and chain[:1] != ["np"]:
-                    return Call("ac_reshape", (self._lower_expr(expr.func.value), *self._lower_call_args(expr)))
+                    base = self._lower_expr(expr.func.value)
+                    reshape_args = [self._lower_expr(arg) for arg in expr.args]
+                    if len(expr.args) == 1 and isinstance(expr.args[0], ast.Tuple):
+                        reshape_args = [self._lower_expr(elt) for elt in expr.args[0].elts]
+                    order_ast = self._keyword_value(expr, "order")
+                    if order_ast is not None:
+                        reshape_args.append(self._lower_expr(order_ast))
+                    return Call("ac_reshape", (base, *reshape_args))
                 if expr.func.attr == "choice" and chain[:1] != ["np"]:
                     base = self._lower_expr(expr.func.value)
                     size_expr = self._keyword_value(expr, "size")
@@ -1079,45 +1546,76 @@ class PythonNumpyFrontend:
                 if chain == ["np", "array"]:
                     if expr.args and isinstance(expr.args[0], ast.List) and not expr.args[0].elts:
                         return Call("ac_zeros", (Constant(0),))
-                    return Call("ac_array", self._lower_call_args(expr))
+                    if expr.args:
+                        return Call("ac_array", (self._lower_expr(expr.args[0]),))
+                    return Call("ac_array", ())
                 if chain == ["np", "asarray"]:
-                    return Call("ac_asarray", tuple(self._lower_expr(arg) for arg in expr.args))
+                    if expr.args:
+                        return Call("ac_asarray", (self._lower_expr(expr.args[0]),))
+                    return Call("ac_asarray", ())
                 if chain == ["np", "roots"]:
                     return Call("ac_roots", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "zeros"]:
                     if expr.args and isinstance(expr.args[0], ast.Tuple) and len(expr.args[0].elts) == 2:
                         return Call("ac_zeros2", tuple(self._lower_expr(elt) for elt in expr.args[0].elts))
                     return Call("ac_zeros", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "ones"]:
+                    if expr.args and isinstance(expr.args[0], ast.Tuple) and len(expr.args[0].elts) == 2:
+                        return Call("ac_full", (*tuple(self._lower_expr(elt) for elt in expr.args[0].elts), Constant(1.0)))
+                    if expr.args:
+                        return Call("ac_full", (self._lower_expr(expr.args[0]), Constant(1.0)))
+                    return Call("ac_full", (Constant(0), Constant(1.0)))
                 if chain == ["np", "where"]:
+                    if len(expr.args) == 3:
+                        return Call("ac_where_select", tuple(self._lower_expr(arg) for arg in expr.args))
                     return Call("ac_where", self._lower_call_args(expr))
+                if chain == ["np", "any"]:
+                    return Call("ac_any", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "empty"]:
                     if expr.args and isinstance(expr.args[0], ast.Tuple) and len(expr.args[0].elts) == 2:
                         return Call("ac_empty2", tuple(self._lower_expr(elt) for elt in expr.args[0].elts))
                     return Call("ac_empty", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "full"]:
+                    if expr.args and isinstance(expr.args[0], ast.Tuple) and len(expr.args[0].elts) == 2:
+                        return Call("ac_full", (*tuple(self._lower_expr(elt) for elt in expr.args[0].elts), self._lower_expr(expr.args[1])))
                     return Call("ac_full", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "arange"]:
+                    if len(expr.args) == 1:
+                        return Call("ac_arange", (Constant(0), self._lower_expr(expr.args[0])))
                     return Call("ac_arange", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "linspace"]:
+                    return Call("ac_linspace", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "column_stack"]:
                     if expr.args and isinstance(expr.args[0], ast.Tuple):
                         return Call("ac_column_stack", tuple(self._lower_expr(elt) for elt in expr.args[0].elts))
                     return Call("ac_column_stack", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "round"]:
                     return Call("ac_round", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "clip"]:
+                    return Call("ac_clip", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "linalg", "solve"]:
                     return Call("ac_solve_linear", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "linalg", "norm"]:
+                    return Call("ac_norm", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["random", "Random"]:
                     return Call("ac_random_init", self._lower_call_args(expr))
                 if chain[:1] == ["math"]:
                     return Call(chain[1], self._lower_call_args(expr))
             raise NotImplementedError(f"unsupported call: {ast.dump(expr)}")
         if isinstance(expr, ast.Attribute):
+            dtype_name = self._numpy_dtype_name(expr)
+            if dtype_name is not None:
+                return Constant(dtype_name)
             if self._attr_chain(expr) == ["np", "inf"]:
                 return Constant(float("inf"))
             if self._attr_chain(expr) == ["np", "pi"]:
                 return Constant(3.141592653589793)
             if self._attr_chain(expr) == ["sys", "argv"]:
                 return ValueRef("ac_argv")
+            if expr.attr == "dtype" and isinstance(expr.value, ast.Name):
+                dtype_name = self._current_dtypes.get(expr.value.id)
+                if dtype_name is not None:
+                    return Constant(dtype_name)
             base = self._lower_expr(expr.value)
             if expr.attr == "T":
                 return Call("ac_transpose", (base,))
@@ -1267,12 +1765,21 @@ class PythonNumpyFrontend:
                 if size_expr is not None:
                     return ArrayTypeRef(ScalarType.REAL64)
                 return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "uniform" and chain[:1] != ["np"]:
+                size_expr = self._keyword_value(expr, "size")
+                if size_expr is not None:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "sum" and chain[:1] != ["np"]:
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "mean" and chain[:1] != ["np"]:
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "copy" and chain[:1] != ["np"]:
                 return self._infer_type(expr.func.value)
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "astype" and chain[:1] != ["np"]:
+                return self._infer_type(expr.func.value)
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr in {"ravel", "flatten"} and chain[:1] != ["np"]:
+                return ArrayTypeRef(ScalarType.REAL64)
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "reshape" and chain[:1] != ["np"]:
                 return ArrayTypeRef(ScalarType.REAL64, rank=self._reshape_rank(expr))
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "choice" and chain[:1] != ["np"]:
@@ -1321,6 +1828,11 @@ class PythonNumpyFrontend:
                     return ScalarType.REAL64
                 if chain == ["np", "all"]:
                     return ScalarType.LOGICAL
+                if chain == ["np", "any"]:
+                    return ScalarType.LOGICAL
+                if chain == ["np", "clip"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    return arg_type
                 if chain == ["np", "dot"]:
                     return ScalarType.REAL64
                 if chain == ["np", "array"] or chain == ["np", "asarray"]:
@@ -1333,13 +1845,21 @@ class PythonNumpyFrontend:
                     if expr.args:
                         return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
                     return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "ones"]:
+                    if expr.args:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
+                    return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "where"]:
+                    if len(expr.args) == 3:
+                        return self._infer_type(expr.args[1])
                     return ArrayTypeRef(ScalarType.INTEGER)
                 if chain == ["np", "empty"] or chain == ["np", "full"]:
                     if expr.args:
                         return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
                     return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "arange"]:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "linspace"]:
                     return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "column_stack"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
@@ -1348,6 +1868,8 @@ class PythonNumpyFrontend:
                     return arg_type
                 if chain == ["np", "linalg", "solve"]:
                     return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "linalg", "norm"]:
+                    return ScalarType.REAL64
                 if chain == ["random", "Random"]:
                     return RecordTypeRef("ac_random_state")
                 if chain[:1] == ["math"]:
@@ -1358,6 +1880,8 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Name):
             return self._current_symbols.get(expr.id, ScalarType.REAL64)
         if isinstance(expr, ast.Attribute):
+            if self._numpy_dtype_name(expr) is not None:
+                return ScalarType.STRING
             if self._attr_chain(expr) == ["np", "inf"]:
                 return ScalarType.REAL64
             if self._attr_chain(expr) == ["np", "pi"]:
@@ -1370,8 +1894,17 @@ class PythonNumpyFrontend:
                 return ScalarType.INTEGER
             if expr.attr == "shape":
                 return self._shape_record_type(expr.value)
+            if expr.attr == "dtype":
+                return ScalarType.STRING
         if isinstance(expr, ast.UnaryOp):
-            return ScalarType.LOGICAL if isinstance(expr.op, ast.Not) else ScalarType.REAL64
+            if isinstance(expr.op, ast.Not):
+                return ScalarType.LOGICAL
+            operand_type = self._infer_type(expr.operand)
+            if isinstance(operand_type, ArrayTypeRef):
+                return operand_type
+            if operand_type == ScalarType.INTEGER:
+                return ScalarType.INTEGER
+            return ScalarType.REAL64
         if isinstance(expr, ast.BinOp):
             left_type = self._infer_type(expr.left)
             right_type = self._infer_type(expr.right)
@@ -1550,6 +2083,35 @@ class PythonNumpyFrontend:
         for keyword in expr.keywords:
             if keyword.arg == name:
                 return keyword.value
+        return None
+
+    def _numpy_dtype_name(self, expr: ast.AST) -> str | None:
+        if not isinstance(expr, ast.Attribute):
+            return None
+        chain = self._attr_chain(expr)
+        mapping = {
+            ("np", "int32"): "int32",
+            ("np", "int64"): "int64",
+            ("np", "float32"): "float32",
+            ("np", "float64"): "float64",
+        }
+        return mapping.get(tuple(chain))
+
+    def _infer_dtype_name(self, expr: ast.AST) -> str | None:
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            chain = self._attr_chain(expr.func)
+            if chain == ["np", "array"] or chain == ["np", "asarray"]:
+                dtype_expr = self._keyword_value(expr, "dtype")
+                return self._numpy_dtype_name(dtype_expr) if dtype_expr is not None else None
+            if chain == ["np", "ones"] or chain == ["np", "zeros"] or chain == ["np", "full"]:
+                dtype_expr = self._keyword_value(expr, "dtype")
+                return self._numpy_dtype_name(dtype_expr) if dtype_expr is not None else None
+            if expr.func.attr == "astype" and chain[:1] != ["np"] and expr.args:
+                return self._numpy_dtype_name(expr.args[0])
+        if isinstance(expr, ast.BinOp):
+            return self._infer_dtype_name(expr.left) or self._infer_dtype_name(expr.right)
+        if isinstance(expr, ast.Name):
+            return self._current_dtypes.get(expr.id)
         return None
 
     def _is_shape_dim_access(self, expr: ast.Subscript) -> bool:

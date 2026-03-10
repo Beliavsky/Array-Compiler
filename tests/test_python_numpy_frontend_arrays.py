@@ -157,6 +157,44 @@ def f(poly):
     assert fn.body[0].value.func == "ac_roots"
 
 
+def test_ac_roots_trims_leading_zero_coefficients() -> None:
+    module_source = "\n".join(
+        [
+            "module roots_trim_mod",
+            "use kind_mod, only: dp",
+            "use ac_numpy_mod",
+            "implicit none",
+            "contains",
+            "subroutine run_example()",
+            "complex(dp), allocatable :: roots(:)",
+            "roots = ac_roots([0.0_dp, 1.0_dp])",
+            "print *, size(roots)",
+            "end subroutine run_example",
+            "end module roots_trim_mod",
+            "",
+        ]
+    )
+    driver_source = "\n".join(
+        [
+            "program roots_trim_driver",
+            "use roots_trim_mod, only: run_example",
+            "implicit none",
+            "call run_example()",
+            "end program roots_trim_driver",
+            "",
+        ]
+    )
+
+    with compiled_fortran_module_with_driver(
+        module_source,
+        module_name="roots_trim_mod",
+        driver_source=driver_source,
+    ) as exe_file:
+        stdout = run_command([str(exe_file)])
+
+    assert stdout.strip() == "0"
+
+
 def test_ac_numpy_runtime_module_compiles() -> None:
     import subprocess
     import tempfile
@@ -399,4 +437,4 @@ def test_xar_sim_acf_pacf_emits_integer_section_not_real_index_array() -> None:
     emitted = FortranBackend().emit(module)
 
     assert "ac_arange_int(" not in emitted
-    assert "rho(h:h - (p + 1) + 2:-1)" in emitted
+    assert "rho(h:h - p + 1:-1)" in emitted

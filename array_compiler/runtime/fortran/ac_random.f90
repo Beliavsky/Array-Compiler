@@ -13,9 +13,14 @@ type :: ac_random_state
     integer :: seed = 0
 end type ac_random_state
 
+interface ac_random_init
+    module procedure ac_random_init_seed
+    module procedure ac_random_init_default
+end interface
+
 contains
 
-function ac_random_init(seed) result(state)
+function ac_random_init_seed(seed) result(state)
 ! Initialize the shared random-number generator state.
 ! seed: integer seed used to populate random_seed.
 integer, intent(in) :: seed
@@ -34,7 +39,12 @@ deallocate(seed_values)
 ac_have_saved = .false.
 ac_saved_value = 0.0d0
 state%seed = seed
-end function ac_random_init
+end function ac_random_init_seed
+
+function ac_random_init_default() result(state)
+type(ac_random_state) :: state
+state = ac_random_init_seed(12345)
+end function ac_random_init_default
 
 function ac_gauss(state, mean, stddev) result(value)
 ! Draw one Gaussian variate using the Box-Muller transform.

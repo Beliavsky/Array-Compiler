@@ -31,7 +31,7 @@ def test_xbs_monte_carlo_lowers_and_emits_fortran() -> None:
     assert "& time_to_maturity, num_paths, seed) result(result_value)" in source
     assert "rng = ac_random_init(seed)" in source
     assert "z = ac_gauss(rng, 0.0d0, 1.0d0)" in source
-    assert "do ac_loop_index = 0, (num_paths - 1), 1" in source
+    assert "do ac_loop_index = 0, num_paths - 1" in source
     assert "call_price = mean_standard_error_and_ci_value%item1" in source
     assert "result_value = monte_carlo_option_prices_result(call_price=call_price" in source
     assert "call_price = results%call_price" in source

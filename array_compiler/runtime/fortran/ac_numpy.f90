@@ -4,7 +4,8 @@ use ac_random_support, only: ac_random_state, ac_gauss
 implicit none
 private
 public :: ac_array, ac_asarray, ac_ndim, ac_shape_dim, ac_empty, ac_empty2, ac_choice_weighted
-public :: ac_choice_no_replace, ac_where, ac_row, ac_set_rows, ac_reshape
+public :: ac_choice_no_replace, ac_where, ac_where_select, ac_row, ac_set_rows, &
+    & ac_reshape
 public :: ac_multivariate_normal, ac_set_row, ac_take_rows, ac_savetxt
 public :: ac_copy, ac_full, ac_eye, ac_column, ac_add_axis, ac_set_column
 public :: ac_sum_axis, ac_max_axis, ac_cov_rowvar_false
@@ -13,8 +14,10 @@ public :: ac_einsum_ni_ij_nj_to_n, ac_loadtxt, ac_atleast_2d, ac_argsort
 public :: ac_transpose, ac_matmul, ac_float, ac_sub_row, ac_sub_col, ac_mul_col
 public :: ac_reverse, ac_r_concat
 public :: ac_roots
-public :: ac_normal_vec, ac_zeros, ac_zeros2, ac_dot, ac_mean, ac_slice, ac_set_slice, ac_fill_slice
-public :: ac_arange, ac_arange_int, ac_column_stack, ac_round, ac_solve_linear
+public :: ac_normal_vec, ac_uniform_vec, ac_zeros, ac_zeros2, ac_dot, ac_mean, &
+    & ac_slice, ac_set_slice, ac_fill_slice, ac_clip, ac_any, ac_norm
+public :: ac_arange, ac_arange_int, ac_linspace, ac_column_stack, ac_round, &
+    & ac_solve_linear, ac_solve_linear_fallback
 public :: ac_item2, ac_set_item2
 
 interface ac_array
@@ -50,6 +53,21 @@ interface ac_zeros
     module procedure ac_zeros_1d
 end interface
 
+interface ac_full
+    module procedure ac_full_1d
+    module procedure ac_full_2d
+end interface
+
+interface ac_clip
+    module procedure ac_clip_scalar_real
+    module procedure ac_clip_1d_real
+end interface
+
+interface ac_round
+    module procedure ac_round_scalar
+    module procedure ac_round_1d
+end interface
+
 interface ac_slice
     module procedure ac_slice_1d_real
 end interface
@@ -58,10 +76,19 @@ interface ac_set_slice
     module procedure ac_set_slice_1d_real
 end interface
 
+interface ac_arange
+    module procedure ac_arange_2
+    module procedure ac_arange_3
+end interface
+
 interface ac_ndim
     module procedure ac_ndim_1d_real
     module procedure ac_ndim_2d_real
     module procedure ac_ndim_1d_int
+end interface
+
+interface ac_any
+    module procedure ac_any_1d_logical
 end interface
 
 interface ac_shape_dim
@@ -84,7 +111,14 @@ end interface
 
 interface ac_reshape
     module procedure ac_reshape_1d_to_2d_real
+    module procedure ac_reshape_1d_to_2d_real_order
     module procedure ac_reshape_2d_to_1d_real
+end interface
+
+interface ac_where_select
+    module procedure ac_where_select_1d_real_real
+    module procedure ac_where_select_1d_real_scalar
+    module procedure ac_where_select_1d_scalar_real
 end interface
 
 interface ac_atleast_2d
@@ -178,21 +212,37 @@ pure function ac_roots_real(coeffs) result(roots)
 ! Find roots of a real polynomial using Durand-Kerner iteration.
 real(dp), intent(in) :: coeffs(:)
 complex(dp), allocatable :: roots(:)
+real(dp), allocatable :: work_coeffs(:)
 complex(dp), allocatable :: current(:), next_roots(:)
 real(dp) :: radius, tol, theta
-integer :: n, i, j, iter, max_iter
+integer :: n, i, j, iter, max_iter, first_nz
 complex(dp) :: denom, delta
 
-n = size(coeffs) - 1
-if (n < 1) error stop "ac_roots requires at least two coefficients"
-if (abs(coeffs(1)) <= 0.0_dp) error stop "ac_roots requires a nonzero leading coefficient"
-if (n == 1) then
-    allocate(roots(1))
-    roots(1) = cmplx(-coeffs(2) / coeffs(1), 0.0_dp, kind=dp)
+first_nz = 0
+do i = 1, size(coeffs)
+    if (abs(coeffs(i)) > 0.0_dp) then
+        first_nz = i
+        exit
+    end if
+end do
+if (first_nz == 0) then
+    allocate(roots(0))
     return
 end if
 
-radius = 1.0_dp + maxval(abs(coeffs(2:))) / abs(coeffs(1))
+work_coeffs = coeffs(first_nz:)
+n = size(work_coeffs) - 1
+if (n < 1) then
+    allocate(roots(0))
+    return
+end if
+if (n == 1) then
+    allocate(roots(1))
+    roots(1) = cmplx(-work_coeffs(2) / work_coeffs(1), 0.0_dp, kind=dp)
+    return
+end if
+
+radius = 1.0_dp + maxval(abs(work_coeffs(2:))) / abs(work_coeffs(1))
 tol = 1.0e-12_dp
 max_iter = 200
 allocate(current(n), next_roots(n), roots(n))
@@ -208,7 +258,7 @@ do iter = 1, max_iter
             if (j /= i) denom = denom * (current(i) - current(j))
         end do
         if (abs(denom) <= tol) denom = cmplx(tol, 0.0_dp, kind=dp)
-        delta = ac_poly_eval_real_complex(coeffs, current(i)) / denom
+        delta = ac_poly_eval_real_complex(work_coeffs, current(i)) / denom
         next_roots(i) = current(i) - delta
     end do
     if (maxval(abs(next_roots - current)) <= tol) exit
@@ -244,6 +294,26 @@ do i = 1, n
     x(i) = ac_gauss(work_state, loc, scale)
 end do
 end function ac_normal_vec
+
+function ac_uniform_vec(state, low, high, n) result(x)
+real(dp), intent(in) :: low, high
+integer, intent(in) :: n
+type(ac_random_state), intent(in) :: state
+real(dp), allocatable :: x(:)
+integer :: i
+integer :: nseed
+integer, allocatable :: seed(:)
+
+call random_seed(size=nseed)
+allocate(seed(nseed))
+seed = state%seed
+call random_seed(put=seed)
+allocate(x(n))
+do i = 1, n
+    call random_number(x(i))
+end do
+x = low + (high - low) * x
+end function ac_uniform_vec
 
 pure function ac_zeros_1d(n) result(x)
 integer, intent(in) :: n
@@ -320,7 +390,7 @@ hi = min(size(x), hi)
 if (hi >= lo) x(lo:hi) = value
 end subroutine ac_fill_slice
 
-pure function ac_arange(start_value, stop_value) result(x)
+pure function ac_arange_2(start_value, stop_value) result(x)
 integer, intent(in) :: start_value, stop_value
 real(dp), allocatable :: x(:)
 integer :: n, i
@@ -330,7 +400,53 @@ allocate(x(n))
 do i = 1, n
     x(i) = real(start_value + i - 1, dp)
 end do
-end function ac_arange
+end function ac_arange_2
+
+pure function ac_arange_3(start_value, stop_value, step_value) result(x)
+integer, intent(in) :: start_value, stop_value, step_value
+real(dp), allocatable :: x(:)
+integer :: n, i, value
+
+if (step_value == 0) then
+    allocate(x(0))
+    return
+end if
+if ((step_value > 0 .and. start_value >= stop_value) .or. (step_value < 0 .and. start_value <= stop_value)) then
+    allocate(x(0))
+    return
+end if
+n = 0
+value = start_value
+do while ((step_value > 0 .and. value < stop_value) .or. (step_value < 0 .and. value > stop_value))
+    n = n + 1
+    value = value + step_value
+end do
+allocate(x(n))
+value = start_value
+do i = 1, n
+    x(i) = real(value, dp)
+    value = value + step_value
+end do
+end function ac_arange_3
+
+pure function ac_linspace(start_value, stop_value, num_points) result(x)
+real(dp), intent(in) :: start_value, stop_value
+integer, intent(in) :: num_points
+real(dp), allocatable :: x(:)
+integer :: i
+
+if (num_points <= 0) then
+    allocate(x(0))
+else if (num_points == 1) then
+    allocate(x(1))
+    x(1) = start_value
+else
+    allocate(x(num_points))
+    do i = 1, num_points
+        x(i) = start_value + (stop_value - start_value) * real(i - 1, dp) / real(num_points - 1, dp)
+    end do
+end if
+end function ac_linspace
 
 pure function ac_arange_int(start_value, stop_value) result(x)
 integer, intent(in) :: start_value, stop_value
@@ -357,7 +473,17 @@ x(:, 3) = c
 x(:, 4) = d
 end function ac_column_stack
 
-pure function ac_round(x, decimals) result(y)
+pure function ac_round_scalar(x, decimals) result(y)
+real(dp), intent(in) :: x
+integer, intent(in) :: decimals
+real(dp) :: y
+real(dp) :: scale
+
+scale = 10.0_dp ** decimals
+y = anint(x * scale) / scale
+end function ac_round_scalar
+
+pure function ac_round_1d(x, decimals) result(y)
 real(dp), intent(in) :: x(:)
 integer, intent(in) :: decimals
 real(dp), allocatable :: y(:)
@@ -365,13 +491,45 @@ real(dp) :: scale
 
 scale = 10.0_dp ** decimals
 y = anint(x * scale) / scale
-end function ac_round
+end function ac_round_1d
+
+pure real(dp) function ac_clip_scalar_real(x, lower, upper)
+real(dp), intent(in) :: x, lower, upper
+ac_clip_scalar_real = min(max(x, lower), upper)
+end function ac_clip_scalar_real
+
+pure function ac_clip_1d_real(x, lower, upper) result(y)
+real(dp), intent(in) :: x(:)
+real(dp), intent(in) :: lower, upper
+real(dp), allocatable :: y(:)
+y = min(max(x, lower), upper)
+end function ac_clip_1d_real
+
+pure logical function ac_any_1d_logical(x)
+logical, intent(in) :: x(:)
+ac_any_1d_logical = any(x)
+end function ac_any_1d_logical
+
+pure real(dp) function ac_norm(x)
+real(dp), intent(in) :: x(:)
+ac_norm = sqrt(sum(x**2))
+end function ac_norm
 
 pure function ac_solve_linear(a, b) result(x)
 real(dp), intent(in) :: a(:, :), b(:)
 real(dp), allocatable :: x(:)
 x = matmul(ac_inv(a), b)
 end function ac_solve_linear
+
+pure function ac_solve_linear_fallback(a, b) result(x)
+real(dp), intent(in) :: a(:, :), b(:)
+real(dp), allocatable :: x(:)
+real(dp), allocatable :: ata(:, :), atb(:)
+
+ata = matmul(transpose(a), a)
+atb = matmul(transpose(a), b)
+x = ac_solve_linear(ata, atb)
+end function ac_solve_linear_fallback
 
 pure function ac_item2(x, i, j) result(value)
 real(dp), intent(in) :: x(:, :)
@@ -434,13 +592,21 @@ real(dp), allocatable :: x(:)
 allocate(x(n))
 end function ac_empty
 
-pure function ac_full(n, value) result(x)
+pure function ac_full_1d(n, value) result(x)
 integer, intent(in) :: n
 real(dp), intent(in) :: value
 real(dp), allocatable :: x(:)
 allocate(x(n))
 x = value
-end function ac_full
+end function ac_full_1d
+
+pure function ac_full_2d(n, m, value) result(x)
+integer, intent(in) :: n, m
+real(dp), intent(in) :: value
+real(dp), allocatable :: x(:, :)
+allocate(x(n, m))
+x = value
+end function ac_full_2d
 
 pure function ac_eye(n) result(x)
 integer, intent(in) :: n
@@ -515,6 +681,44 @@ do i = 1, size(mask)
 end do
 end function ac_where
 
+pure function ac_where_select_1d_real_real(mask, x_true, x_false) result(y)
+logical, intent(in) :: mask(:)
+real(dp), intent(in) :: x_true(:), x_false(:)
+real(dp), allocatable :: y(:)
+allocate(y(size(mask)))
+where (mask)
+    y = x_true
+elsewhere
+    y = x_false
+end where
+end function ac_where_select_1d_real_real
+
+pure function ac_where_select_1d_real_scalar(mask, x_true, x_false) result(y)
+logical, intent(in) :: mask(:)
+real(dp), intent(in) :: x_true(:)
+real(dp), intent(in) :: x_false
+real(dp), allocatable :: y(:)
+allocate(y(size(mask)))
+where (mask)
+    y = x_true
+elsewhere
+    y = x_false
+end where
+end function ac_where_select_1d_real_scalar
+
+pure function ac_where_select_1d_scalar_real(mask, x_true, x_false) result(y)
+logical, intent(in) :: mask(:)
+real(dp), intent(in) :: x_true
+real(dp), intent(in) :: x_false(:)
+real(dp), allocatable :: y(:)
+allocate(y(size(mask)))
+where (mask)
+    y = x_true
+elsewhere
+    y = x_false
+end where
+end function ac_where_select_1d_scalar_real
+
 pure function ac_row_2d_real(x, row_index) result(y)
 real(dp), intent(in) :: x(:, :)
 integer, intent(in) :: row_index
@@ -581,6 +785,25 @@ do j = 1, m
     end do
 end do
 end function ac_reshape_1d_to_2d_real
+
+pure function ac_reshape_1d_to_2d_real_order(x, n, m, order) result(y)
+real(dp), intent(in) :: x(:)
+integer, intent(in) :: n, m
+character(len=*), intent(in) :: order
+real(dp), allocatable :: y(:, :)
+integer :: i, j
+
+allocate(y(n, m))
+if (order == "F") then
+    y = reshape(x, [n, m])
+else
+    do j = 1, m
+        do i = 1, n
+            y(i, j) = x((i - 1) * m + j)
+        end do
+    end do
+end if
+end function ac_reshape_1d_to_2d_real_order
 
 pure function ac_reshape_2d_to_1d_real(x, n) result(y)
 real(dp), intent(in) :: x(:, :)

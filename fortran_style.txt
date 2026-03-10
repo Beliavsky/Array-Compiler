@@ -24,3 +24,10 @@ constant when possible.
 Static helper functions should have a brief comment below the signature
 explaining what they do and inline comments explaining the meaning of each
 argument.
+
+The RESULT of a function should be on a separate line after function
+arguments and before local variables.
+
+All procedure arguments must have a declared INTENT. If an argument can
+legally be intent(in) it should be.
+

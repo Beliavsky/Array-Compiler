@@ -4,8 +4,10 @@ import argparse
 import difflib
 import hashlib
 import math
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ from pathlib import Path
 from array_compiler.compiler import Compiler
 from array_compiler.frontends.python_numpy import PythonNumpyFrontend
 from array_compiler.backends.fortran.helpers import HelperRegistry
+from array_compiler.fortran_style import STYLE_LEVELS
 from array_compiler.ir.nodes import Function
 
 
@@ -35,6 +38,11 @@ HELPER_MOD_FILES = {
     "ac_random": "ac_random_support.mod",
     "ac_numpy": "ac_numpy_mod.mod",
 }
+HELPER_CACHE_FORMAT_VERSION = "v2"
+
+DEFAULT_GFORTRAN_COMPILER = "gfortran -O3 -march=native -flto -Wfatal-errors"
+DEFAULT_IFX_COMPILER_WINDOWS = "ifx /O3"
+DEFAULT_IFX_COMPILER_POSIX = "ifx -O3"
 
 
 def quote_cmd_arg(value: str) -> str:
@@ -186,19 +194,96 @@ def compare_outputs(python_stdout: str, fortran_stdout: str, *, stochastic: bool
     return False
 
 
-def transpile_python_to_fortran(input_path: Path, output_path: Path):
+def transpile_python_to_fortran(input_path: Path, output_path: Path, *, style_level: str = "full"):
     source = input_path.read_text(encoding="utf-8-sig")
     module_name = output_path.stem
     frontend = PythonNumpyFrontend()
     module = frontend.lower_source(source, module_name=module_name)
-    fortran_source = Compiler().emit_fortran(module)
+    fortran_source = Compiler().emit_fortran(module, style_level=style_level)
     output_path.write_text(fortran_source, encoding="utf-8")
     return module, fortran_source
 
 
+def default_ifx_compiler() -> str:
+    return DEFAULT_IFX_COMPILER_WINDOWS if os.name == "nt" else DEFAULT_IFX_COMPILER_POSIX
+
+
+def resolve_compiler_command(*, compiler: str | None, ifx: bool) -> str:
+    if compiler:
+        return compiler
+    if ifx:
+        return default_ifx_compiler()
+    return DEFAULT_GFORTRAN_COMPILER
+
+
+def compiler_kind(compiler_parts: list[str]) -> str:
+    executable = Path(compiler_parts[0]).name.lower() if compiler_parts else ""
+    if executable.startswith("ifx"):
+        return "ifx"
+    return "gfortran"
+
+
 def helper_cache_dir(repo_root: Path, compiler_parts: list[str]) -> Path:
-    compiler_key = hashlib.sha256("\0".join(compiler_parts).encode("utf-8")).hexdigest()[:16]
+    compiler_key = hashlib.sha256(
+        "\0".join([HELPER_CACHE_FORMAT_VERSION, *compiler_parts]).encode("utf-8")
+    ).hexdigest()[:16]
     return repo_root / ".array_compiler_cache" / "fortran" / compiler_key
+
+
+def helper_cache_root(repo_root: Path) -> Path:
+    return repo_root / ".array_compiler_cache"
+
+
+def helper_object_suffix(kind: str) -> str:
+    if kind == "ifx" and os.name == "nt":
+        return ".obj"
+    return ".o"
+
+
+def helper_compile_command(
+    *,
+    compiler_parts: list[str],
+    source_path: Path,
+    cache_dir: Path,
+    object_path: Path,
+) -> list[str]:
+    kind = compiler_kind(compiler_parts)
+    if kind == "ifx" and os.name == "nt":
+        return [
+            *compiler_parts,
+            "/c",
+            f"/module:{cache_dir}",
+            f"/object:{object_path}",
+            f"/I{cache_dir}",
+            str(source_path),
+        ]
+    return [*compiler_parts, "-c", str(source_path), "-J", str(cache_dir), "-o", str(object_path)]
+
+
+def build_command(
+    *,
+    compiler_parts: list[str],
+    cache_dir: Path,
+    helper_objects: list[Path],
+    output_path: Path,
+    driver_path: Path | None,
+    exe_path: Path,
+    compile_only: bool,
+) -> list[str]:
+    kind = compiler_kind(compiler_parts)
+    if kind == "ifx" and os.name == "nt":
+        cmd = [*compiler_parts, f"/I{cache_dir}", *(str(path) for path in helper_objects), str(output_path)]
+        if driver_path is not None:
+            cmd.extend([str(driver_path), f"/exe:{exe_path}"])
+        else:
+            cmd.append("/c")
+        return cmd
+    cmd = [*compiler_parts, "-I", str(cache_dir), *(str(path) for path in helper_objects), str(output_path)]
+    if driver_path is not None:
+        cmd += [str(driver_path), "-o", str(exe_path)]
+    else:
+        cmd.insert(len(compiler_parts), "-c")
+    return cmd
 
 
 def ensure_cached_helpers(
@@ -210,9 +295,10 @@ def ensure_cached_helpers(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached_objects: list[Path] = []
     rebuilt: list[str] = []
+    object_suffix = helper_object_suffix(compiler_kind(compiler_parts))
     for key in helper_keys:
         source_path = helper_registry.path_for(key)
-        object_path = cache_dir / f"{source_path.stem}.o"
+        object_path = cache_dir / f"{source_path.stem}{object_suffix}"
         module_path = cache_dir / HELPER_MOD_FILES.get(key, f"{source_path.stem}.mod")
         needs_rebuild = (
             not object_path.exists()
@@ -220,7 +306,12 @@ def ensure_cached_helpers(
             or not module_path.exists()
         )
         if needs_rebuild:
-            compile_cmd = compiler_parts + ["-c", str(source_path), "-J", str(cache_dir), "-o", str(object_path)]
+            compile_cmd = helper_compile_command(
+                compiler_parts=compiler_parts,
+                source_path=source_path,
+                cache_dir=cache_dir,
+                object_path=object_path,
+            )
             compile_proc = subprocess.run(
                 compile_cmd,
                 cwd=cache_dir,
@@ -238,16 +329,41 @@ def ensure_cached_helpers(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Translate Python to Fortran with optional compile/run timing")
-    parser.add_argument("input_py", help="Python source file")
+    parser.add_argument("input_py", nargs="?", help="Python source file")
     parser.add_argument("--out", help="Output Fortran file")
     parser.add_argument("--compile", action="store_true", help="Compile generated Fortran")
     parser.add_argument("--run", action="store_true", help="Compile and run generated Fortran")
+    parser.add_argument("--run-both", action="store_true", help="Run Python, transpile, compile, and run Fortran without timings or diff")
     parser.add_argument("--time-both", action="store_true", help="Run Python, transpile, compile, run Fortran, and print timings")
     parser.add_argument("--tee", action="store_true", help="Print the generated Fortran source after transpilation")
-    parser.add_argument("--compiler", default="gfortran -O3 -march=native -flto -Wfatal-errors", help="Compiler command")
+    parser.add_argument("--compiler", help="Compiler command")
+    parser.add_argument("--ifx", action="store_true", help="Use the Intel Fortran compiler preset")
+    parser.add_argument("--clean-cache", action="store_true", help="Remove cached Fortran helper build artifacts and exit")
+    parser.add_argument("--style-level", choices=STYLE_LEVELS, default="full", help="Fortran post-processing level")
+    parser.add_argument("--no-style", action="store_true", help="Disable Fortran style post-processing")
     args = parser.parse_args()
 
-    if args.time_both:
+    if args.no_style:
+        args.style_level = "none"
+
+    repo_root = Path(__file__).resolve().parent
+
+    if args.clean_cache:
+        cache_root = helper_cache_root(repo_root)
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
+            print(f"Removed cache: {cache_root}")
+        else:
+            print(f"Cache not present: {cache_root}")
+        return 0
+
+    if not args.input_py:
+        parser.error("the following arguments are required: input_py")
+
+    if args.run_both and args.time_both:
+        parser.error("--run-both and --time-both cannot be used together")
+
+    if args.time_both or args.run_both:
         args.run = True
         args.compile = True
     elif args.run:
@@ -259,7 +375,7 @@ def main() -> int:
     python_stdout = ""
     python_rc = 0
 
-    if args.time_both:
+    if args.time_both or args.run_both:
         py_cmd = [sys.executable, str(input_path)]
         print("Run (python):", format_command(py_cmd))
         t0 = time.perf_counter()
@@ -271,7 +387,8 @@ def main() -> int:
                 print(python_stdout.rstrip())
             if python_stderr.strip():
                 print(python_stderr.rstrip())
-            emit_timing_summary(timings)
+            if args.time_both:
+                emit_timing_summary(timings)
             return python_rc
         print("Run (python): PASS")
         if python_stdout.strip():
@@ -281,7 +398,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     try:
-        module, fortran_source = transpile_python_to_fortran(input_path, output_path)
+        module, fortran_source = transpile_python_to_fortran(input_path, output_path, style_level=args.style_level)
     except Exception as exc:  # pragmatic CLI surface for now
         timings["transpile"] = time.perf_counter() - t0
         print(f"Transpile failed: {exc}")
@@ -297,7 +414,8 @@ def main() -> int:
     helper_registry = HelperRegistry()
     helper_keys = helper_keys_for_source(fortran_source)
     auto_added = [helper_registry.get(key).filename for key in helper_keys if key != "kind_mod"]
-    compiler_parts = shlex.split(args.compiler)
+    compiler_command = resolve_compiler_command(compiler=args.compiler, ifx=args.ifx)
+    compiler_parts = shlex.split(compiler_command)
     if len(compiler_parts) > 1:
         print("Compile options:", " ".join(compiler_parts[1:]))
     else:
@@ -311,7 +429,6 @@ def main() -> int:
     except RuntimeError:
         entry_name = ""
 
-    repo_root = Path(__file__).resolve().parent
     cache_dir = helper_cache_dir(repo_root, compiler_parts)
     t0 = time.perf_counter()
     try:
@@ -324,15 +441,21 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         build_dir = Path(tmpdir)
         driver_path = build_dir / f"{output_path.stem}_driver.f90"
+        local_output_path = build_dir / output_path.name
         exe_path = output_path.with_suffix(".exe")
+        local_output_path.write_text(fortran_source, encoding="utf-8")
         if entry_name:
             driver_path.write_text(build_driver_source(output_path.stem, entry_name), encoding="utf-8")
 
-        build_cmd = compiler_parts + ["-I", str(cache_dir)] + [*(str(path) for path in helper_objects), str(output_path)]
-        if entry_name:
-            build_cmd += [str(driver_path), "-o", str(exe_path)]
-        else:
-            build_cmd.insert(len(compiler_parts), "-c")
+        build_cmd = build_command(
+            compiler_parts=compiler_parts,
+            cache_dir=cache_dir,
+            helper_objects=helper_objects,
+            output_path=local_output_path,
+            driver_path=(driver_path if entry_name else None),
+            exe_path=exe_path,
+            compile_only=not bool(entry_name),
+        )
         t0 = time.perf_counter()
         compile_proc = subprocess.run(build_cmd, cwd=build_dir, capture_output=True, text=True, check=False)
         timings["compile"] = time.perf_counter() - t0
@@ -358,7 +481,8 @@ def main() -> int:
                     print(fortran_stdout.rstrip())
                 if fortran_stderr.strip():
                     print(fortran_stderr.rstrip())
-                emit_timing_summary(timings)
+                if args.time_both:
+                    emit_timing_summary(timings)
                 return run_rc
             print("Run: PASS")
             if fortran_stdout.strip():

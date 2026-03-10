@@ -23,11 +23,17 @@ def test_xbs_lowers_and_emits_fortran() -> None:
     assert "pure elemental function black_scholes_price(spot, strike, rate, volatility, &" in source
     assert "& time_to_maturity, option_type) result(result_value)" in source
     assert "real(dp), intent(in) :: spot, strike, rate, volatility, time_to_maturity" in source
+    black_scholes_block = source[
+        source.index("pure elemental function black_scholes_price"):
+        source.index("end function black_scholes_price")
+    ]
+    assert black_scholes_block.index("character(len=*), intent(in) :: option_type") < black_scholes_block.index("real(dp) :: result_value")
+    assert black_scholes_block.index("real(dp) :: result_value") < black_scholes_block.index("character(len=:), allocatable :: option_kind")
     assert "subroutine run_example()" in source
     assert "subroutine run_main()" in source
     assert "real(dp), parameter :: spot = 100.0d0, strike = 100.0d0, rate = 0.05d0, &" in source
     assert "& volatility = 0.2d0, time_to_maturity = 1.0d0" in source
-    assert "\ntolerance = 1d-10\n" in source
+    assert "if (parity_error <= 1d-10) then" in source
     assert "\nspot = 100.0d0\n" not in source
     assert "option_kind = ac_lower(trim(adjustl(option_type)))" in source
     assert 'if ((option_kind /= "call") .and. (option_kind /= "put")) error stop &' in source

@@ -13,48 +13,42 @@ public :: run_main
 contains
 
 pure elemental function normal_cdf(x) result(result_value)
+! Standard normal cumulative distribution function.
 real(dp), intent(in) :: x
 real(dp) :: result_value
 result_value = 0.5d0 * (1.0d0 + erf(x / sqrt(2.0d0)))
 end function normal_cdf
 
-pure elemental function black_scholes_price(spot, strike, rate, volatility, &
-    & time_to_maturity, option_type) result(result_value)
+pure elemental function black_scholes_price(spot, strike, rate, volatility, time_to_maturity, option_type) result(result_value)
+! Return the Black-Scholes price of a European call or put.
 real(dp), intent(in) :: spot, strike, rate, volatility, time_to_maturity
 character(len=*), intent(in) :: option_type
+real(dp) :: result_value
 character(len=:), allocatable :: option_kind
 real(dp) :: sqrt_t, d1, d2, discounted_strike
-real(dp) :: result_value
 if (spot <= 0.0d0) error stop "spot must be > 0"
 if (strike <= 0.0d0) error stop "strike must be > 0"
 if (volatility <= 0.0d0) error stop "volatility must be > 0"
 if (time_to_maturity <= 0.0d0) error stop "time_to_maturity must be > 0"
 option_kind = ac_lower(trim(adjustl(option_type)))
-if ((option_kind /= "call") .and. (option_kind /= "put")) error stop &
-    & "option_type must be 'call' or 'put'"
+if ((option_kind /= "call") .and. (option_kind /= "put")) error stop "option_type must be 'call' or 'put'"
 sqrt_t = sqrt(time_to_maturity)
-d1 = (log(spot / strike) + ((rate + ((0.5d0 * volatility) * volatility)) * &
-    & time_to_maturity)) / (volatility * sqrt_t)
+d1 = (log(spot / strike) + ((rate + ((0.5d0 * volatility) * volatility)) * time_to_maturity)) / (volatility * sqrt_t)
 d2 = d1 - (volatility * sqrt_t)
 discounted_strike = strike * exp(-rate * time_to_maturity)
 if (option_kind == "call") then
-    result_value = (spot * normal_cdf(d1)) - (discounted_strike * &
-    & normal_cdf(d2))
+    result_value = (spot * normal_cdf(d1)) - (discounted_strike * normal_cdf(d2))
 else
-    result_value = (discounted_strike * normal_cdf(-d2)) - (spot * &
-    & normal_cdf(-d1))
+    result_value = (discounted_strike * normal_cdf(-d2)) - (spot * normal_cdf(-d1))
 end if
 end function black_scholes_price
 
 subroutine run_example()
-real(dp), parameter :: spot = 100.0d0, strike = 100.0d0, rate = 0.05d0, &
-    & volatility = 0.2d0, time_to_maturity = 1.0d0
-real(dp) :: call_price, put_price, parity_left, parity_right, parity_error, &
-    & tolerance
-call_price = black_scholes_price(spot, strike, rate, volatility, &
-    & time_to_maturity, "call")
-put_price = black_scholes_price(spot, strike, rate, volatility, &
-    & time_to_maturity, "put")
+! Price one call and one put and verify put-call parity.
+real(dp), parameter :: spot = 100.0d0, strike = 100.0d0, rate = 0.05d0, volatility = 0.2d0, time_to_maturity = 1.0d0
+real(dp) :: call_price, put_price, parity_left, parity_right, parity_error, tolerance
+call_price = black_scholes_price(spot, strike, rate, volatility, time_to_maturity, "call")
+put_price = black_scholes_price(spot, strike, rate, volatility, time_to_maturity, "put")
 parity_left = call_price - put_price
 parity_right = spot - (strike * exp(-rate * time_to_maturity))
 parity_error = abs(parity_left - parity_right)

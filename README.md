@@ -29,6 +29,12 @@ The current Fortran path now includes the beginning of that packaging layer:
 - a small `bind(C)` wrapper generator for scalar numeric procedures
 - diagnostics for exported procedures that are not yet C-interoperable
 
+The repository also now includes a Python annotator:
+
+- `xpyannotate.py` adds conservative type, rank, `Final`, and function signature annotations to runnable Python source
+- it can report conservative parameter-intent classifications such as `intent=in`, `intent=rebound`, and `intent=mutated`
+- its purpose is to reduce ambiguity before translation, especially for Fortran-oriented code generation
+
 ## Initial Goals
 
 - extract shared compiler concepts from `xp2f.py`, `xoct2f.py`, `xr2f.py`, and `xc2f.py`
@@ -44,7 +50,12 @@ The current Fortran path now includes the beginning of that packaging layer:
 - `array_compiler/frontends/`: source-language frontends
 - `array_compiler/backends/fortran/`: Fortran-specific lowering and emission
 - `array_compiler/runtime/fortran/`: helper registry and copied runtime helpers
+- `array_compiler/annotator.py`: conservative Python type/rank/Final annotator
+- `array_compiler/annotations.py`: runnable Python annotation aliases such as `Array1D[T]`
 - `docs/`: architecture and migration notes
+- `x2f.py`: Python-to-Fortran driver
+- `x2f_batch.py`: batch runner for corpus testing
+- `xpyannotate.py`: command-line entry point for the Python annotator
 
 ## Near-Term Plan
 

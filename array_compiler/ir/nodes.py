@@ -172,6 +172,16 @@ class Continue:
 
 
 @dataclass(frozen=True)
+class Break:
+    pass
+
+
+@dataclass(frozen=True)
+class Comment:
+    text: str
+
+
+@dataclass(frozen=True)
 class Pass:
     pass
 
@@ -212,6 +222,12 @@ class ForRange:
     step: object | None = None
 
 
+@dataclass(frozen=True)
+class While:
+    test: object
+    body: tuple[object, ...]
+
+
 @dataclass
 class Function:
     name: str
@@ -219,6 +235,7 @@ class Function:
     locals: list[tuple[str, object]] = field(default_factory=list)
     body: list[object] = field(default_factory=list)
     result_type: object | None = None
+    leading_comments: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -232,3 +249,4 @@ class Program:
     name: str
     locals: list[tuple[str, object]] = field(default_factory=list)
     body: list[object] = field(default_factory=list)
+    leading_comments: list[str] = field(default_factory=list)

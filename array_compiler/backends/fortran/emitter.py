@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ...ir.module import Module
 from ...ir.nodes import (
@@ -13,7 +13,9 @@ from ...ir.nodes import (
     BinaryOp,
     BinaryOperator,
     BooleanOp,
+    Break,
     Call,
+    Comment,
     ConditionalExpr,
     Compare,
     CompareOperator,
@@ -38,8 +40,8 @@ from ...ir.nodes import (
     UnaryOp,
     UnaryOperator,
     ValueRef,
+    While,
 )
-from .formatter import wrap_fortran_source
 from .helpers import HelperRegistry
 
 AC_NUMPY_FUNCS = {
@@ -104,10 +106,21 @@ class FortranBackend:
     _current_symbols: dict[str, object] = field(default_factory=dict, init=False)
     _record_types: dict[str, object] = field(default_factory=dict, init=False)
     _function_results: dict[str, object] = field(default_factory=dict, init=False)
+    _functions_by_name: dict[str, Function] = field(default_factory=dict, init=False)
+    _purity_cache: dict[str, bool] = field(default_factory=dict, init=False)
+    _mutated_args: set[str] = field(default_factory=set, init=False)
+    _dummy_arg_names: dict[str, str] = field(default_factory=dict, init=False)
 
     def emit(self, module: Module) -> str:
+        from ...fortran_style import apply_fortran_style
+
+        return apply_fortran_style(self.emit_raw(module), style_level="full")
+
+    def emit_raw(self, module: Module) -> str:
         self._record_types = {record.name: record for record in module.records}
         self._function_results = {fn.name: fn.result_type for fn in module.functions}
+        self._functions_by_name = {fn.name: fn for fn in module.functions}
+        self._purity_cache = {}
         helper_keys = self._required_helpers(module)
         export_names = self._export_names(module)
         lines: list[str] = [
@@ -132,7 +145,7 @@ class FortranBackend:
             lines.extend(self._emit_program(module.program))
             lines.append("")
         lines.extend([f"end module {module.name}", ""])
-        return wrap_fortran_source("\n".join(lines), max_len=80)
+        return "\n".join(lines)
 
     def _emit_use_lines(self, helper_keys: set[str]) -> list[str]:
         lines: list[str] = ["use kind_mod, only: dp"]
@@ -173,39 +186,59 @@ class FortranBackend:
     def _emit_function(self, fn: Function) -> list[str]:
         attrs = self._procedure_attrs(fn)
         parameter_values, local_values, body = self._extract_local_parameters(fn.locals, fn.body)
+        body, removable_locals = self._rewrite_body(body, {name for name, _ in local_values})
+        local_values = self._prune_unused_locals(local_values, body, removable_locals)
         previous_symbols = self._current_symbols
+        previous_mutated_args = self._mutated_args
+        previous_dummy_arg_names = self._dummy_arg_names
+        self._mutated_args = self._assigned_argument_names(fn)
+        self._dummy_arg_names = {
+            name: self._dummy_arg_name(name) for name, _ in fn.args if name in self._mutated_args
+        }
+        emitted_args = [(self._dummy_arg_names.get(name, name), arg_type) for name, arg_type in fn.args]
+        shadow_locals = [(name, arg_type) for name, arg_type in fn.args if name in self._mutated_args]
+        init_body = [Assignment(ValueRef(name), ValueRef(self._dummy_arg_names[name])) for name in self._mutated_args]
+        local_values = [*shadow_locals, *local_values]
         if fn.result_type is None:
-            arg_text = ", ".join(name for name, _ in fn.args)
+            arg_text = ", ".join(name for name, _ in emitted_args)
             prefix = (attrs + " ") if attrs else ""
             self._current_symbols = {name: typ for name, typ in fn.args}
             self._current_symbols.update({name: typ for name, typ in fn.locals})
             lines = [f"{prefix}subroutine {fn.name}({arg_text})"]
-            lines.extend(self._declare_args(fn.args))
+            lines.extend(f"! {comment}" for comment in fn.leading_comments)
+            lines.extend(self._declare_args(emitted_args))
             lines.extend(self._declare_parameters(parameter_values))
             lines.extend(self._declare_locals(local_values))
             body = self._trim_terminal_return(body, "")
+            body = [*init_body, *body]
             for stmt in body:
                 lines.extend(self._emit_stmt(stmt, result_name=""))
             lines.append(f"end subroutine {fn.name}")
             self._current_symbols = previous_symbols
+            self._mutated_args = previous_mutated_args
+            self._dummy_arg_names = previous_dummy_arg_names
             return lines
 
         result_name = "result_value"
-        arg_text = ", ".join(name for name, _ in fn.args)
+        arg_text = ", ".join(name for name, _ in emitted_args)
         prefix = (attrs + " ") if attrs else ""
         self._current_symbols = {name: typ for name, typ in fn.args}
         self._current_symbols.update({name: typ for name, typ in fn.locals})
         self._current_symbols[result_name] = fn.result_type
         lines = [f"{prefix}function {fn.name}({arg_text}) result({result_name})"]
-        lines.extend(self._declare_args(fn.args))
+        lines.extend(f"! {comment}" for comment in fn.leading_comments)
+        lines.extend(self._declare_args(emitted_args))
+        lines.append(self._declare_result(result_name, fn.result_type))
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
-        lines.append(self._declare_result(result_name, fn.result_type))
         body = self._trim_terminal_return(body, result_name)
+        body = [*init_body, *body]
         for stmt in body:
             lines.extend(self._emit_stmt(stmt, result_name))
         lines.append(f"end function {fn.name}")
         self._current_symbols = previous_symbols
+        self._mutated_args = previous_mutated_args
+        self._dummy_arg_names = previous_dummy_arg_names
         return lines
 
     def _emit_program(self, program) -> list[str]:
@@ -213,9 +246,12 @@ class FortranBackend:
             getattr(program, "locals", []),
             program.body,
         )
+        body, removable_locals = self._rewrite_body(body, {name for name, _ in local_values})
+        local_values = self._prune_unused_locals(local_values, body, removable_locals)
         previous_symbols = self._current_symbols
         self._current_symbols = {name: typ for name, typ in getattr(program, "locals", [])}
         lines = [f"subroutine {program.name}()"]
+        lines.extend(f"! {comment}" for comment in getattr(program, "leading_comments", []))
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
         for stmt in body:
@@ -234,7 +270,7 @@ class FortranBackend:
         if isinstance(stmt, IndexAssignment):
             index_text = self._emit_index_selector(stmt.index)
             if index_text is None:
-                index_text = f"{self._emit_expr(stmt.index)} + 1"
+                index_text = self._emit_plus_one(stmt.index)
             return [f"{self._emit_expr(stmt.target)}({index_text}) = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, FieldAssignment):
             return [f"{self._emit_expr(stmt.target)}%{stmt.field} = {self._emit_expr(stmt.value)}"]
@@ -250,11 +286,18 @@ class FortranBackend:
             return [f'error stop {self._emit_string(stmt.message)}']
         if isinstance(stmt, Continue):
             return ["cycle"]
+        if isinstance(stmt, Break):
+            return ["exit"]
+        if isinstance(stmt, Comment):
+            return [f"! {stmt.text}" if stmt.text else "!"]
         if isinstance(stmt, Pass):
             return []
         if isinstance(stmt, Print):
             if not stmt.values:
                 return ["print *"]
+            native_write = self._render_print_as_native_write(stmt.values)
+            if native_write is not None:
+                return [native_write]
             rendered = [self._render_print_value(value) for value in stmt.values]
             if all(is_string for _, is_string in rendered):
                 text = self._join_rendered_print_values(stmt.values, rendered)
@@ -263,13 +306,26 @@ class FortranBackend:
             return [f"print *, {parts}"]
         if isinstance(stmt, ExprStatement):
             if isinstance(stmt.expr, Call):
+                if stmt.expr.func == "ac_set_item2" and len(stmt.expr.args) == 4:
+                    base, row_index, col_index, value_expr = stmt.expr.args
+                    return [
+                        f"{self._emit_expr(base)}({self._emit_plus_one(row_index)}, {self._emit_plus_one(col_index)}) = "
+                        f"{self._emit_expr(value_expr)}"
+                    ]
                 if stmt.expr.func == "ac_fill_slice":
+                    direct_stmt = self._emit_direct_slice_assignment(stmt.expr)
+                    if direct_stmt is not None:
+                        return [direct_stmt]
                     array_expr, start_expr, stop_expr, value_expr = stmt.expr.args
                     base = self._emit_expr(array_expr)
                     start_text = self._emit_expr(start_expr)
                     stop_text = self._emit_expr(stop_expr)
                     value_text = self._emit_expr(value_expr)
                     return [f"{base}(({start_text}) + 1:{stop_text}) = {value_text}"]
+                if stmt.expr.func == "ac_set_slice":
+                    direct_stmt = self._emit_direct_slice_assignment(stmt.expr)
+                    if direct_stmt is not None:
+                        return [direct_stmt]
                 return [f"call {stmt.expr.func}({', '.join(self._emit_expr(arg) for arg in stmt.expr.args)})"]
             raise NotImplementedError(f"unsupported expression statement: {stmt.expr!r}")
         if isinstance(stmt, If):
@@ -290,13 +346,24 @@ class FortranBackend:
             return lines
         if isinstance(stmt, ForRange):
             start = self._emit_expr(stmt.start) if stmt.start is not None else "0"
-            step = self._emit_expr(stmt.step) if stmt.step is not None else "1"
             if stmt.step is None:
-                stop = f"({self._emit_expr(stmt.stop)} - 1)"
+                stop_expr = self._simplify_expr(BinaryOp(stmt.stop, BinaryOperator.SUB, Constant(1)))
+                stop = self._emit_expr(stop_expr)
+                lines = [f"do {stmt.target} = {start}, {stop}"]
             else:
+                step = self._emit_expr(stmt.step)
                 raw_stop = self._emit_expr(stmt.stop)
                 stop = f"merge(({raw_stop} - 1), ({raw_stop} + 1), ({step} > 0))"
-            lines = [f"do {stmt.target} = {start}, {stop}, {step}"]
+                if step == "1":
+                    lines = [f"do {stmt.target} = {start}, {stop}"]
+                else:
+                    lines = [f"do {stmt.target} = {start}, {stop}, {step}"]
+            for inner in stmt.body:
+                lines.extend("    " + line for line in self._emit_stmt(inner, result_name))
+            lines.append("end do")
+            return lines
+        if isinstance(stmt, While):
+            lines = [f"do while ({self._emit_expr(stmt.test)})"]
             for inner in stmt.body:
                 lines.extend("    " + line for line in self._emit_stmt(inner, result_name))
             lines.append("end do")
@@ -304,6 +371,7 @@ class FortranBackend:
         raise NotImplementedError(f"unsupported IR statement: {type(stmt).__name__}")
 
     def _emit_expr(self, expr: object) -> str:
+        expr = self._simplify_expr(expr)
         if isinstance(expr, ValueRef):
             return expr.name
         if isinstance(expr, FieldAccess):
@@ -311,8 +379,11 @@ class FortranBackend:
         if isinstance(expr, IndexAccess):
             index_text = self._emit_index_selector(expr.index)
             if index_text is None:
-                index_text = f"{self._emit_expr(expr.index)} + 1"
-            return f"{self._emit_expr(expr.value)}({index_text})"
+                index_text = self._emit_plus_one(expr.index)
+            base_text = self._emit_expr(expr.value)
+            if isinstance(expr.value, Call) and expr.value.func == "ac_array_literal":
+                base_text = f"({base_text})"
+            return f"{base_text}({index_text})"
         if isinstance(expr, RecordLiteral):
             fields = ", ".join(f"{name}={self._emit_expr(value)}" for name, value in expr.fields)
             return f"{expr.type_name}({fields})"
@@ -331,8 +402,34 @@ class FortranBackend:
         if isinstance(expr, Call):
             if expr.func == "ac_array_literal":
                 return self._emit_array_literal(expr.args, "")
-            if expr.func == "ac_array" and len(expr.args) == 1 and self._is_nested_array_literal(expr.args[0]):
-                return f"ac_array({self._emit_nested_array(expr.args[0])})"
+            if expr.func == "ac_array" and len(expr.args) == 1:
+                if self._is_nested_array_literal(expr.args[0]):
+                    return self._emit_nested_array(expr.args[0])
+                if isinstance(expr.args[0], Call) and expr.args[0].func == "ac_array_literal":
+                    return self._emit_array_literal(expr.args[0].args, "")
+            if expr.func == "ac_item2" and len(expr.args) == 3:
+                base, row_index, col_index = expr.args
+                return f"{self._emit_expr(base)}({self._emit_plus_one(row_index)}, {self._emit_plus_one(col_index)})"
+            if expr.func == "ac_dot" and len(expr.args) == 2:
+                left, right = expr.args
+                if left == right:
+                    return f"sum({self._emit_expr(left)}**2)"
+                return f"sum({self._emit_expr(left)} * {self._emit_expr(right)})"
+            if expr.func == "ac_r_concat":
+                return "[" + ", ".join(self._emit_expr(arg) for arg in expr.args) + "]"
+            if expr.func == "ac_slice":
+                direct_expr = self._emit_direct_slice_expr(expr)
+                if direct_expr is not None:
+                    return direct_expr
+            if expr.func == "ac_reverse" and len(expr.args) == 1:
+                direct_expr = self._emit_direct_reverse_expr(expr.args[0])
+                if direct_expr is not None:
+                    return direct_expr
+                if self._is_simple_slice_base(expr.args[0]):
+                    base = self._emit_expr(expr.args[0])
+                    return f"{base}(size({base}):1:-1)"
+                base = self._emit_expr(expr.args[0])
+                return f"ac_reverse({base})"
             if expr.func == "ac_arange_int":
                 start_text = self._emit_expr(expr.args[0])
                 stop_text = self._emit_expr(expr.args[1])
@@ -347,8 +444,12 @@ class FortranBackend:
             return f"{expr.func}({args})"
         if isinstance(expr, BinaryOp):
             if expr.op == BinaryOperator.POW:
-                return f"{self._emit_operand(expr.left)} ** {self._emit_operand(expr.right)}"
-            return f"{self._emit_operand(expr.left)} {expr.op.value} {self._emit_operand(expr.right)}"
+                return f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} ** {self._emit_binary_operand(expr.right, expr.op, is_right=True)}"
+            return (
+                f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} "
+                f"{expr.op.value} "
+                f"{self._emit_binary_operand(expr.right, expr.op, is_right=True)}"
+            )
         if isinstance(expr, UnaryOp):
             if expr.op == UnaryOperator.NOT:
                 return f".not. {self._emit_operand(expr.operand)}"
@@ -362,7 +463,13 @@ class FortranBackend:
                 CompareOperator.GT: ">",
                 CompareOperator.GE: ">=",
             }
-            return f"{self._emit_operand(expr.left)} {op_map[expr.op]} {self._emit_operand(expr.right)}"
+            left = expr.left
+            right = expr.right
+            if isinstance(right, Constant) and right.value is None and self._expr_type(left) == ScalarType.INTEGER:
+                right = Constant(-1)
+            if isinstance(left, Constant) and left.value is None and self._expr_type(right) == ScalarType.INTEGER:
+                left = Constant(-1)
+            return f"{self._emit_operand(left)} {op_map[expr.op]} {self._emit_operand(right)}"
         if isinstance(expr, BooleanOp):
             op = ".and." if expr.op == "and" else ".or."
             return f" {op} ".join(self._emit_operand(value) for value in expr.values)
@@ -375,19 +482,230 @@ class FortranBackend:
     def _declare_args(self, values: list[tuple[str, object]]) -> list[str]:
         return self._coalesce_declarations(values, self._arg_decl_parts)
 
+    def _emit_direct_slice_expr(self, expr: Call) -> str | None:
+        if len(expr.args) != 3:
+            return None
+        array_expr, start_expr, stop_expr = expr.args
+        if not self._can_emit_direct_slice(array_expr, start_expr, stop_expr):
+            return None
+        base = self._emit_expr(array_expr)
+        return f"{base}({self._emit_slice_lower_bound(array_expr, start_expr)}:{self._emit_slice_upper_bound(array_expr, stop_expr)})"
+
+    def _emit_direct_slice_assignment(self, expr: Call) -> str | None:
+        if len(expr.args) != 4:
+            return None
+        array_expr, start_expr, stop_expr, value_expr = expr.args
+        if not self._can_emit_direct_slice(array_expr, start_expr, stop_expr):
+            return None
+        base = self._emit_expr(array_expr)
+        value = self._emit_expr(value_expr)
+        if self._is_full_direct_slice(array_expr, start_expr, stop_expr):
+            return f"{base} = {value}"
+        return (
+            f"{base}({self._emit_slice_lower_bound(array_expr, start_expr)}:"
+            f"{self._emit_slice_upper_bound(array_expr, stop_expr)}) = {value}"
+        )
+
+    def _emit_direct_reverse_expr(self, expr: object) -> str | None:
+        if isinstance(expr, Call) and expr.func == "ac_slice" and len(expr.args) == 3:
+            array_expr, start_expr, stop_expr = expr.args
+            if not self._can_emit_direct_slice(array_expr, start_expr, stop_expr):
+                return None
+            base = self._emit_expr(array_expr)
+            upper = self._emit_slice_upper_bound(array_expr, stop_expr)
+            lower = self._emit_slice_lower_bound(array_expr, start_expr)
+            return f"{base}({upper}:{lower}:-1)"
+        return None
+
+    def _can_emit_direct_slice(self, array_expr: object, start_expr: object, stop_expr: object) -> bool:
+        return self._is_simple_slice_base(array_expr) and self._is_slice_expr(start_expr) and self._is_slice_expr(stop_expr)
+
+    def _is_full_direct_slice(self, array_expr: object, start_expr: object, stop_expr: object) -> bool:
+        return (
+            isinstance(start_expr, Constant)
+            and start_expr.value == 0
+            and isinstance(stop_expr, Call)
+            and stop_expr.func == "size"
+            and len(stop_expr.args) == 1
+            and stop_expr.args[0] == array_expr
+        )
+
+    def _is_simple_slice_base(self, expr: object) -> bool:
+        return isinstance(expr, (ValueRef, FieldAccess))
+
+    def _is_slice_expr(self, expr: object) -> bool:
+        if isinstance(expr, Constant) and isinstance(expr.value, int):
+            return True
+        if isinstance(expr, ValueRef):
+            return True
+        if isinstance(expr, Call):
+            if expr.func == "size":
+                return True
+            if expr.func in {"min", "max", "abs", "int"}:
+                return all(self._is_slice_expr(arg) for arg in expr.args)
+        if isinstance(expr, BinaryOp) and expr.op in {BinaryOperator.ADD, BinaryOperator.SUB}:
+            return self._is_slice_expr(expr.left) and self._is_slice_expr(expr.right)
+        if isinstance(expr, UnaryOp) and expr.op == UnaryOperator.MINUS:
+            return self._is_slice_expr(expr.operand)
+        return False
+
+    def _emit_slice_lower_bound(self, array_expr: object, expr: object) -> str:
+        if self._is_negative_slice_expr(expr):
+            return self._emit_expr(
+                self._simplify_expr(
+                    BinaryOp(
+                        BinaryOp(Call("size", (array_expr,)), BinaryOperator.ADD, expr),
+                        BinaryOperator.ADD,
+                        Constant(1),
+                    )
+                )
+            )
+        return self._emit_plus_one(expr)
+
+    def _emit_slice_upper_bound(self, array_expr: object, expr: object) -> str:
+        if self._is_negative_slice_expr(expr):
+            return self._emit_expr(self._simplify_expr(BinaryOp(Call("size", (array_expr,)), BinaryOperator.ADD, expr)))
+        return self._emit_expr(expr)
+
+    def _is_negative_slice_expr(self, expr: object) -> bool:
+        value = self._const_int_expr_value(expr)
+        if value is not None:
+            return value < 0
+        if isinstance(expr, UnaryOp) and expr.op == UnaryOperator.MINUS:
+            return True
+        if (
+            isinstance(expr, BinaryOp)
+            and expr.op == BinaryOperator.SUB
+            and isinstance(expr.left, Constant)
+            and expr.left.value == 0
+        ):
+            return True
+        return False
+
+    def _emit_plus_one(self, expr: object) -> str:
+        simplified = self._simplify_expr(BinaryOp(expr, BinaryOperator.ADD, Constant(1)))
+        return self._emit_expr(simplified)
+
+    def _simplify_expr(self, expr: object) -> object:
+        if isinstance(expr, BinaryOp):
+            left = self._simplify_expr(expr.left)
+            right = self._simplify_expr(expr.right)
+            if expr.op == BinaryOperator.ADD:
+                if isinstance(right, UnaryOp) and right.op == UnaryOperator.MINUS:
+                    return self._simplify_expr(BinaryOp(left, BinaryOperator.SUB, right.operand))
+                if isinstance(left, UnaryOp) and left.op == UnaryOperator.MINUS:
+                    return self._simplify_expr(BinaryOp(right, BinaryOperator.SUB, left.operand))
+            if expr.op == BinaryOperator.SUB:
+                right_extracted = self._extract_offset(right)
+                if right_extracted is not None:
+                    right_base, right_offset = right_extracted
+                    if right_base is not None and right_offset != 0:
+                        return self._simplify_expr(
+                            BinaryOp(
+                                BinaryOp(left, BinaryOperator.SUB, right_base),
+                                BinaryOperator.ADD,
+                                Constant(-right_offset),
+                            )
+                        )
+            offset_expr = self._offset_expr(BinaryOp(left, expr.op, right))
+            if offset_expr is not None:
+                return offset_expr
+            if expr.op == BinaryOperator.ADD:
+                left_value = self._const_int_expr_value(left)
+                right_value = self._const_int_expr_value(right)
+                if left_value is not None and right_value is not None:
+                    return Constant(left_value + right_value)
+                if left_value == 0:
+                    return right
+                if right_value == 0:
+                    return left
+            if expr.op == BinaryOperator.SUB:
+                left_value = self._const_int_expr_value(left)
+                right_value = self._const_int_expr_value(right)
+                if left_value is not None and right_value is not None:
+                    return Constant(left_value - right_value)
+                if right_value == 0:
+                    return left
+            return BinaryOp(left, expr.op, right)
+        if isinstance(expr, UnaryOp):
+            operand = self._simplify_expr(expr.operand)
+            operand_value = self._const_int_expr_value(operand)
+            if operand_value is not None:
+                if expr.op == UnaryOperator.PLUS:
+                    return Constant(operand_value)
+                if expr.op == UnaryOperator.MINUS:
+                    return Constant(-operand_value)
+            return UnaryOp(expr.op, operand)
+        return expr
+
+    def _const_int_expr_value(self, expr: object) -> int | None:
+        if isinstance(expr, Constant) and isinstance(expr.value, int):
+            return expr.value
+        return None
+
+    def _offset_expr(self, expr: object) -> object | None:
+        extracted = self._extract_offset(expr)
+        if extracted is None:
+            return None
+        base, offset = extracted
+        if base is None:
+            return Constant(offset)
+        if offset == 0:
+            return base
+        if offset > 0:
+            return BinaryOp(base, BinaryOperator.ADD, Constant(offset))
+        return BinaryOp(base, BinaryOperator.SUB, Constant(-offset))
+
+    def _extract_offset(self, expr: object) -> tuple[object | None, int] | None:
+        value = self._const_int_expr_value(expr)
+        if value is not None:
+            return None, value
+        if isinstance(expr, BinaryOp):
+            left = self._extract_offset(expr.left)
+            right = self._extract_offset(expr.right)
+            if expr.op == BinaryOperator.ADD and left is not None and right is not None:
+                left_base, left_offset = left
+                right_base, right_offset = right
+                if left_base is None:
+                    return right_base, left_offset + right_offset
+                if right_base is None:
+                    return left_base, left_offset + right_offset
+            if expr.op == BinaryOperator.SUB and left is not None and right is not None:
+                left_base, left_offset = left
+                right_base, right_offset = right
+                if right_base is None:
+                    return left_base, left_offset - right_offset
+            if expr.op == BinaryOperator.ADD:
+                right_value = self._const_int_expr_value(expr.right)
+                if right_value is not None:
+                    return expr.left, right_value
+                left_value = self._const_int_expr_value(expr.left)
+                if left_value is not None:
+                    return expr.right, left_value
+            if expr.op == BinaryOperator.SUB:
+                right_value = self._const_int_expr_value(expr.right)
+                if right_value is not None:
+                    return expr.left, -right_value
+        if isinstance(expr, UnaryOp) and expr.op == UnaryOperator.MINUS:
+            operand = self._extract_offset(expr.operand)
+            if operand is not None and operand[0] is None:
+                return None, -operand[1]
+        if isinstance(expr, (ValueRef, Call, IndexAccess, FieldAccess)):
+            return expr, 0
+        return None
+
     def _declare_locals(self, values: list[tuple[str, object]]) -> list[str]:
         return self._coalesce_declarations(values, self._local_decl_parts)
 
     def _declare_parameters(
         self,
-        values: list[tuple[str, object, Constant]],
+        values: list[tuple[str, object, object]],
     ) -> list[str]:
         lines: list[str] = []
         current_spec: str | None = None
         current_names: list[str] = []
-        for name, value_type, constant in values:
-            spec = f"{self._type_name(value_type)}, parameter"
-            name_expr = f"{name} = {self._emit_expr(constant)}"
+        for name, value_type, value_expr in values:
+            spec, name_expr = self._parameter_decl_parts(name, value_type, value_expr)
             if current_spec == spec:
                 current_names.append(name_expr)
                 continue
@@ -399,45 +717,64 @@ class FortranBackend:
             lines.append(f"{current_spec} :: {', '.join(current_names)}")
         return lines
 
+    def _parameter_decl_parts(self, name: str, value_type: object, value_expr: object) -> tuple[str, str]:
+        if isinstance(value_type, ArrayTypeRef):
+            shape = self._parameter_shape(value_expr)
+            if shape is None:
+                raise NotImplementedError(f"parameter array shape could not be determined for {name}")
+            spec = f"{self._type_name(value_type.element_type)}, parameter"
+            return spec, f"{name}{shape} = {self._emit_parameter_value(value_expr)}"
+        return f"{self._type_name(value_type)}, parameter", f"{name} = {self._emit_parameter_value(value_expr)}"
+
+    def _parameter_shape(self, value_expr: object) -> str | None:
+        if isinstance(value_expr, Call) and value_expr.func == "ac_array" and len(value_expr.args) == 1:
+            return self._parameter_shape(value_expr.args[0])
+        if isinstance(value_expr, Call) and value_expr.func == "ac_array_literal":
+            return f"({len(value_expr.args)})"
+        return None
+
+    def _emit_parameter_value(self, value_expr: object) -> str:
+        if isinstance(value_expr, Call) and value_expr.func == "ac_array" and len(value_expr.args) == 1:
+            return self._emit_parameter_value(value_expr.args[0])
+        return self._emit_expr(value_expr)
+
     def _coalesce_declarations(self, values: list[tuple[str, object]], part_builder) -> list[str]:
         lines: list[str] = []
-        current_spec: str | None = None
-        current_names: list[str] = []
+        grouped_names: dict[str, list[str]] = {}
+        spec_order: list[str] = []
         for name, value_type in values:
             spec, name_expr = part_builder(name, value_type)
-            if current_spec == spec:
-                current_names.append(name_expr)
-                continue
-            if current_spec is not None:
-                lines.append(f"{current_spec} :: {', '.join(current_names)}")
-            current_spec = spec
-            current_names = [name_expr]
-        if current_spec is not None:
-            lines.append(f"{current_spec} :: {', '.join(current_names)}")
+            if spec not in grouped_names:
+                grouped_names[spec] = []
+                spec_order.append(spec)
+            grouped_names[spec].append(name_expr)
+        for spec in spec_order:
+            lines.append(f"{spec} :: {', '.join(grouped_names[spec])}")
         return lines
 
     def _extract_local_parameters(
         self,
         locals_list: list[tuple[str, object]],
         body: list[object],
-    ) -> tuple[list[tuple[str, object, Constant]], list[tuple[str, object]], list[object]]:
+    ) -> tuple[list[tuple[str, object, object]], list[tuple[str, object]], list[object]]:
         local_types = {name: value_type for name, value_type in locals_list}
         parameter_names: set[str] = set()
-        parameter_values: dict[str, Constant] = {}
-        leading_assignment_count = 0
-        for stmt in body:
+        parameter_values: dict[str, object] = {}
+        parameter_assignment_indexes: set[int] = set()
+        for index, stmt in enumerate(body):
+            if isinstance(stmt, Comment):
+                continue
             if not isinstance(stmt, Assignment):
                 break
             name = stmt.target.name
             value_type = local_types.get(name)
             if (
-                value_type in {ScalarType.INTEGER, ScalarType.REAL64, ScalarType.LOGICAL}
-                and isinstance(stmt.value, Constant)
+                self._is_parameter_candidate(value_type, stmt.value)
                 and name not in parameter_names
             ):
                 parameter_names.add(name)
                 parameter_values[name] = stmt.value
-                leading_assignment_count += 1
+                parameter_assignment_indexes.add(index)
                 continue
             break
         if not parameter_names:
@@ -453,16 +790,326 @@ class FortranBackend:
             for name, value_type in locals_list
             if name not in parameter_names
         ]
-        filtered_body = body[leading_assignment_count:]
+        filtered_body = [
+            stmt for index, stmt in enumerate(body)
+            if index not in parameter_assignment_indexes
+        ]
         return parameters, filtered_locals, filtered_body
 
+    def _rewrite_body(self, body: list[object], local_names: set[str]) -> tuple[list[object], set[str]]:
+        current = list(body)
+        removable_locals: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            rewritten: list[object] = []
+            index = 0
+            while index < len(current):
+                replacement = self._rewrite_full_array_init(current, index)
+                if replacement is not None:
+                    new_stmt, consumed = replacement
+                    rewritten.append(new_stmt)
+                    index += consumed
+                    changed = True
+                    continue
+                rewritten.append(current[index])
+                index += 1
+            current = rewritten
+            replacement = self._rewrite_single_use_temp(current, local_names)
+            if replacement is not None:
+                current, removed_name = replacement
+                removable_locals.add(removed_name)
+                changed = True
+        return current, removable_locals
+
+    def _rewrite_full_array_init(self, body: list[object], index: int) -> tuple[object, int] | None:
+        if index + 2 >= len(body):
+            return None
+        init_stmt = body[index]
+        head_stmt = body[index + 1]
+        tail_stmt = body[index + 2]
+        if not (
+            isinstance(init_stmt, Assignment)
+            and isinstance(init_stmt.target, ValueRef)
+            and isinstance(init_stmt.value, Call)
+            and init_stmt.value.func in {"ac_empty", "ac_zeros"}
+            and len(init_stmt.value.args) == 1
+            and isinstance(head_stmt, IndexAssignment)
+            and isinstance(head_stmt.target, ValueRef)
+            and head_stmt.target.name == init_stmt.target.name
+            and isinstance(head_stmt.index, Constant)
+            and head_stmt.index.value == 0
+            and isinstance(tail_stmt, ExprStatement)
+            and isinstance(tail_stmt.expr, Call)
+            and tail_stmt.expr.func == "ac_set_slice"
+            and len(tail_stmt.expr.args) == 4
+        ):
+            return None
+        slice_target, start_expr, stop_expr, tail_value = tail_stmt.expr.args
+        if not (
+            isinstance(slice_target, ValueRef)
+            and slice_target.name == init_stmt.target.name
+            and isinstance(start_expr, Constant)
+            and start_expr.value == 1
+            and isinstance(stop_expr, Call)
+            and stop_expr.func == "size"
+            and len(stop_expr.args) == 1
+            and isinstance(stop_expr.args[0], ValueRef)
+            and stop_expr.args[0].name == init_stmt.target.name
+        ):
+            return None
+        return (
+            Assignment(
+                init_stmt.target,
+                Call("ac_concat", (head_stmt.value, tail_value)),
+            ),
+            3,
+        )
+
+    def _rewrite_single_use_temp(self, body: list[object], local_names: set[str]) -> tuple[list[object], str] | None:
+        for index, stmt in enumerate(body):
+            if not (
+                isinstance(stmt, Assignment)
+                and isinstance(stmt.target, ValueRef)
+                and stmt.target.name in local_names
+                and self._expr_is_safe_to_inline(stmt.value)
+            ):
+                continue
+            use_index = self._next_real_stmt_index(body, index + 1)
+            if use_index is None:
+                continue
+            name = stmt.target.name
+            if self._stmt_read_count(body[use_index], name) != 1:
+                continue
+            if any(self._stmt_read_count(other, name) or self._stmt_write_count(other, name) for other in body[use_index + 1:]):
+                continue
+            new_body = list(body[:index])
+            new_body.extend(body[index + 1:use_index])
+            new_body.append(self._substitute_in_stmt(body[use_index], name, stmt.value))
+            new_body.extend(body[use_index + 1:])
+            return new_body, name
+        return None
+
+    def _next_real_stmt_index(self, body: list[object], start: int) -> int | None:
+        for index in range(start, len(body)):
+            if not isinstance(body[index], Comment):
+                return index
+        return None
+
+    def _prune_unused_locals(
+        self,
+        local_values: list[tuple[str, object]],
+        body: list[object],
+        removable_locals: set[str],
+    ) -> list[tuple[str, object]]:
+        used_names = {name for name, _ in local_values if self._body_mentions_name(body, name)}
+        return [
+            (name, value_type)
+            for name, value_type in local_values
+            if name in used_names or name not in removable_locals
+        ]
+
+    def _body_mentions_name(self, body: list[object], name: str) -> bool:
+        return any(self._stmt_read_count(stmt, name) or self._stmt_write_count(stmt, name) for stmt in body)
+
+    def _expr_is_safe_to_inline(self, expr: object) -> bool:
+        if isinstance(expr, Call):
+            if expr.func in {
+                "ac_random_init",
+                "ac_gauss",
+                "ac_choice_weighted",
+                "ac_choice_no_replace",
+                "ac_normal_vec",
+                "ac_multivariate_normal",
+                "ac_loadtxt",
+                "ac_savetxt",
+                "ac_fill_slice",
+            }:
+                return False
+            return all(self._expr_is_safe_to_inline(arg) for arg in expr.args)
+        if isinstance(expr, (BinaryOp, Compare)):
+            return self._expr_is_safe_to_inline(expr.left) and self._expr_is_safe_to_inline(expr.right)
+        if isinstance(expr, UnaryOp):
+            return self._expr_is_safe_to_inline(expr.operand)
+        if isinstance(expr, BooleanOp):
+            return all(self._expr_is_safe_to_inline(value) for value in expr.values)
+        if isinstance(expr, ConditionalExpr):
+            return (
+                self._expr_is_safe_to_inline(expr.test)
+                and self._expr_is_safe_to_inline(expr.body)
+                and self._expr_is_safe_to_inline(expr.orelse)
+            )
+        if isinstance(expr, (FieldAccess, IndexAccess)):
+            return self._expr_is_safe_to_inline(expr.value)
+        if isinstance(expr, RecordLiteral):
+            return all(self._expr_is_safe_to_inline(value) for _, value in expr.fields)
+        if isinstance(expr, ListComprehension):
+            return self._expr_is_safe_to_inline(expr.body) and self._expr_is_safe_to_inline(expr.iterable)
+        return True
+
+    def _stmt_read_count(self, stmt: object, name: str) -> int:
+        if isinstance(stmt, Assignment):
+            return self._expr_read_count(stmt.value, name)
+        if isinstance(stmt, IndexAssignment):
+            return (
+                self._expr_read_count(stmt.target, name)
+                + self._expr_read_count(stmt.index, name)
+                + self._expr_read_count(stmt.value, name)
+            )
+        if isinstance(stmt, FieldAssignment):
+            return self._expr_read_count(stmt.target, name) + self._expr_read_count(stmt.value, name)
+        if isinstance(stmt, AugmentedAssignment):
+            return int(stmt.target.name == name) + self._expr_read_count(stmt.value, name)
+        if isinstance(stmt, Return):
+            return 0 if stmt.value is None else self._expr_read_count(stmt.value, name)
+        if isinstance(stmt, Raise):
+            return 0
+        if isinstance(stmt, Break | Continue | Comment | Pass):
+            return 0
+        if isinstance(stmt, Print):
+            return sum(self._expr_read_count(value, name) for value in stmt.values)
+        if isinstance(stmt, ExprStatement):
+            return self._expr_read_count(stmt.expr, name)
+        if isinstance(stmt, If):
+            return (
+                self._expr_read_count(stmt.test, name)
+                + sum(self._stmt_read_count(inner, name) for inner in stmt.body)
+                + sum(self._stmt_read_count(inner, name) for inner in stmt.orelse)
+            )
+        if isinstance(stmt, ForRange):
+            return (
+                (0 if stmt.start is None else self._expr_read_count(stmt.start, name))
+                + self._expr_read_count(stmt.stop, name)
+                + (0 if stmt.step is None else self._expr_read_count(stmt.step, name))
+                + sum(self._stmt_read_count(inner, name) for inner in stmt.body)
+            )
+        if isinstance(stmt, While):
+            return self._expr_read_count(stmt.test, name) + sum(self._stmt_read_count(inner, name) for inner in stmt.body)
+        return 0
+
+    def _stmt_write_count(self, stmt: object, name: str) -> int:
+        if isinstance(stmt, Assignment):
+            return int(stmt.target.name == name)
+        if isinstance(stmt, AugmentedAssignment):
+            return int(stmt.target.name == name)
+        if isinstance(stmt, If):
+            return sum(self._stmt_write_count(inner, name) for inner in stmt.body) + sum(
+                self._stmt_write_count(inner, name) for inner in stmt.orelse
+            )
+        if isinstance(stmt, ForRange):
+            return sum(self._stmt_write_count(inner, name) for inner in stmt.body)
+        if isinstance(stmt, While):
+            return sum(self._stmt_write_count(inner, name) for inner in stmt.body)
+        return 0
+
+    def _expr_read_count(self, expr: object, name: str) -> int:
+        if isinstance(expr, ValueRef):
+            return int(expr.name == name)
+        if hasattr(expr, "__dataclass_fields__"):
+            return sum(self._expr_read_count(getattr(expr, field_name), name) for field_name in expr.__dataclass_fields__)
+        if isinstance(expr, (list, tuple)):
+            return sum(self._expr_read_count(item, name) for item in expr)
+        return 0
+
+    def _substitute_in_stmt(self, stmt: object, name: str, replacement_expr: object) -> object:
+        if isinstance(stmt, Assignment):
+            return replace(stmt, value=self._substitute_in_expr(stmt.value, name, replacement_expr))
+        if isinstance(stmt, IndexAssignment):
+            return replace(
+                stmt,
+                target=self._substitute_in_expr(stmt.target, name, replacement_expr),
+                index=self._substitute_in_expr(stmt.index, name, replacement_expr),
+                value=self._substitute_in_expr(stmt.value, name, replacement_expr),
+            )
+        if isinstance(stmt, FieldAssignment):
+            return replace(
+                stmt,
+                target=self._substitute_in_expr(stmt.target, name, replacement_expr),
+                value=self._substitute_in_expr(stmt.value, name, replacement_expr),
+            )
+        if isinstance(stmt, AugmentedAssignment):
+            return replace(stmt, value=self._substitute_in_expr(stmt.value, name, replacement_expr))
+        if isinstance(stmt, Return):
+            return stmt if stmt.value is None else replace(stmt, value=self._substitute_in_expr(stmt.value, name, replacement_expr))
+        if isinstance(stmt, Print):
+            return replace(stmt, values=tuple(self._substitute_in_expr(value, name, replacement_expr) for value in stmt.values))
+        if isinstance(stmt, ExprStatement):
+            return replace(stmt, expr=self._substitute_in_expr(stmt.expr, name, replacement_expr))
+        if isinstance(stmt, If):
+            return replace(
+                stmt,
+                test=self._substitute_in_expr(stmt.test, name, replacement_expr),
+                body=tuple(self._substitute_in_stmt(inner, name, replacement_expr) for inner in stmt.body),
+                orelse=tuple(self._substitute_in_stmt(inner, name, replacement_expr) for inner in stmt.orelse),
+            )
+        if isinstance(stmt, ForRange):
+            return replace(
+                stmt,
+                start=None if stmt.start is None else self._substitute_in_expr(stmt.start, name, replacement_expr),
+                stop=self._substitute_in_expr(stmt.stop, name, replacement_expr),
+                step=None if stmt.step is None else self._substitute_in_expr(stmt.step, name, replacement_expr),
+                body=tuple(self._substitute_in_stmt(inner, name, replacement_expr) for inner in stmt.body),
+            )
+        if isinstance(stmt, While):
+            return replace(
+                stmt,
+                test=self._substitute_in_expr(stmt.test, name, replacement_expr),
+                body=tuple(self._substitute_in_stmt(inner, name, replacement_expr) for inner in stmt.body),
+            )
+        return stmt
+
+    def _substitute_in_expr(self, expr: object, name: str, replacement_expr: object) -> object:
+        if isinstance(expr, ValueRef):
+            return replacement_expr if expr.name == name else expr
+        if hasattr(expr, "__dataclass_fields__"):
+            updates = {
+                field_name: self._substitute_in_expr(getattr(expr, field_name), name, replacement_expr)
+                for field_name in expr.__dataclass_fields__
+            }
+            return replace(expr, **updates)
+        if isinstance(expr, tuple):
+            return tuple(self._substitute_in_expr(item, name, replacement_expr) for item in expr)
+        if isinstance(expr, list):
+            return [self._substitute_in_expr(item, name, replacement_expr) for item in expr]
+        return expr
+
+    def _is_parameter_candidate(self, value_type: object, value_expr: object) -> bool:
+        if value_type in {ScalarType.INTEGER, ScalarType.REAL64, ScalarType.LOGICAL}:
+            return self._is_scalar_parameter_expr(value_expr)
+        if isinstance(value_type, ArrayTypeRef) and value_type.rank == 1:
+            return self._is_array_parameter_expr(value_expr)
+        return False
+
+    def _is_scalar_parameter_expr(self, expr: object) -> bool:
+        if isinstance(expr, Constant) and isinstance(expr.value, (int, float, bool)):
+            return True
+        if isinstance(expr, UnaryOp) and expr.op in {UnaryOperator.PLUS, UnaryOperator.MINUS}:
+            return self._is_scalar_parameter_expr(expr.operand)
+        if isinstance(expr, BinaryOp) and expr.op in {
+            BinaryOperator.ADD,
+            BinaryOperator.SUB,
+            BinaryOperator.MUL,
+            BinaryOperator.DIV,
+            BinaryOperator.POW,
+        }:
+            return self._is_scalar_parameter_expr(expr.left) and self._is_scalar_parameter_expr(expr.right)
+        return False
+
+    def _is_array_parameter_expr(self, expr: object) -> bool:
+        if isinstance(expr, Call) and expr.func == "ac_array" and len(expr.args) == 1:
+            return self._is_array_parameter_expr(expr.args[0])
+        if isinstance(expr, Call) and expr.func == "ac_array_literal":
+            return all(self._is_scalar_parameter_expr(arg) for arg in expr.args)
+        return False
+
     def _arg_decl_parts(self, name: str, value_type: object) -> tuple[str, str]:
+        intent_suffix = ", intent(in)"
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
-            return f"{self._type_name(value_type.element_type)}, intent(in)", f"{name}{dims}"
+            return f"{self._type_name(value_type.element_type)}{intent_suffix}", f"{name}{dims}"
         if value_type == ScalarType.STRING:
-            return "character(len=*), intent(in)", name
-        return f"{self._type_name(value_type)}, intent(in)", name
+            return f"character(len=*){intent_suffix}", name
+        return f"{self._type_name(value_type)}{intent_suffix}", name
 
     def _local_decl_parts(self, name: str, value_type: object) -> tuple[str, str]:
         if isinstance(value_type, ArrayTypeRef):
@@ -561,8 +1208,16 @@ class FortranBackend:
             return self._emit_expr(expr)
         if isinstance(expr, BinaryOp):
             if expr.op == BinaryOperator.POW:
-                return f"{self._emit_operand_with_binding(expr.left, bindings)} ** {self._emit_operand_with_binding(expr.right, bindings)}"
-            return f"{self._emit_operand_with_binding(expr.left, bindings)} {expr.op.value} {self._emit_operand_with_binding(expr.right, bindings)}"
+                return (
+                    f"{self._emit_binary_operand_with_binding(expr.left, expr.op, bindings, is_right=False)} "
+                    f"** "
+                    f"{self._emit_binary_operand_with_binding(expr.right, expr.op, bindings, is_right=True)}"
+                )
+            return (
+                f"{self._emit_binary_operand_with_binding(expr.left, expr.op, bindings, is_right=False)} "
+                f"{expr.op.value} "
+                f"{self._emit_binary_operand_with_binding(expr.right, expr.op, bindings, is_right=True)}"
+            )
         if isinstance(expr, UnaryOp):
             if expr.op == UnaryOperator.NOT:
                 return f".not. {self._emit_operand_with_binding(expr.operand, bindings)}"
@@ -578,11 +1233,57 @@ class FortranBackend:
             return f"({text})"
         return text
 
+    def _emit_binary_operand(self, expr: object, parent_op: BinaryOperator, *, is_right: bool) -> str:
+        text = self._emit_expr(expr)
+        if self._needs_binary_parens(expr, parent_op, is_right=is_right):
+            return f"({text})"
+        return text
+
     def _emit_operand_with_binding(self, expr: object, bindings: dict[str, str]) -> str:
         text = self._emit_expr_with_binding(expr, bindings)
         if isinstance(expr, (BinaryOp, Compare, BooleanOp, ConditionalExpr)):
             return f"({text})"
         return text
+
+    def _emit_binary_operand_with_binding(
+        self,
+        expr: object,
+        parent_op: BinaryOperator,
+        bindings: dict[str, str],
+        *,
+        is_right: bool,
+    ) -> str:
+        text = self._emit_expr_with_binding(expr, bindings)
+        if self._needs_binary_parens(expr, parent_op, is_right=is_right):
+            return f"({text})"
+        return text
+
+    def _needs_binary_parens(self, expr: object, parent_op: BinaryOperator, *, is_right: bool) -> bool:
+        if isinstance(expr, (Compare, BooleanOp, ConditionalExpr)):
+            return True
+        if not isinstance(expr, BinaryOp):
+            return False
+        child_op = expr.op
+        parent_prec = self._binary_precedence(parent_op)
+        child_prec = self._binary_precedence(child_op)
+        if child_prec < parent_prec:
+            return True
+        if child_prec > parent_prec:
+            return False
+        if parent_op == BinaryOperator.POW:
+            return True
+        if parent_op == BinaryOperator.SUB and is_right and child_op in {BinaryOperator.ADD, BinaryOperator.SUB}:
+            return True
+        if parent_op == BinaryOperator.DIV and is_right and child_op in {BinaryOperator.MUL, BinaryOperator.DIV}:
+            return True
+        return False
+
+    def _binary_precedence(self, op: BinaryOperator) -> int:
+        if op == BinaryOperator.POW:
+            return 3
+        if op in {BinaryOperator.MUL, BinaryOperator.DIV}:
+            return 2
+        return 1
 
     def _trim_terminal_return(self, body: list[object], result_name: str) -> list[object]:
         if not body:
@@ -621,6 +1322,10 @@ class FortranBackend:
             value = self._emit_expr(stmt.value)
             return f"if ({self._emit_expr(test)}) {stmt.target.name} = {stmt.target.name} {stmt.op.value} {value}"
         if isinstance(stmt, ExprStatement) and isinstance(stmt.expr, Call):
+            if stmt.expr.func in {"ac_fill_slice", "ac_set_slice"}:
+                direct_stmt = self._emit_direct_slice_assignment(stmt.expr)
+                if direct_stmt is not None:
+                    return f"if ({self._emit_expr(test)}) {direct_stmt}"
             if stmt.expr.func == "ac_fill_slice":
                 array_expr, start_expr, stop_expr, value_expr = stmt.expr.args
                 base = self._emit_expr(array_expr)
@@ -658,17 +1363,60 @@ class FortranBackend:
             return False
         if any(isinstance(arg_type, (ArrayTypeRef, RecordTypeRef)) for _, arg_type in fn.args):
             return False
+        if self._assigned_argument_names(fn):
+            return False
         if any(self._stmt_uses_impurity(stmt) for stmt in fn.body):
             return False
         return True
 
     def _is_pure(self, fn: Function) -> bool:
+        cached = self._purity_cache.get(fn.name)
+        if cached is not None:
+            return cached
+        self._purity_cache[fn.name] = False
+        if self._assigned_argument_names(fn):
+            return False
         if any(self._stmt_uses_impurity(stmt) for stmt in fn.body):
             return False
+        self._purity_cache[fn.name] = True
         return True
 
+    def _dummy_arg_name(self, name: str) -> str:
+        return f"{name}_arg"
+
+    def _assigned_argument_names(self, fn: Function) -> set[str]:
+        arg_names = {name for name, _ in fn.args}
+        assigned: set[str] = set()
+        for stmt in fn.body:
+            assigned.update(self._assigned_names_in_stmt(stmt))
+        return assigned & arg_names
+
+    def _assigned_names_in_stmt(self, stmt: object) -> set[str]:
+        if isinstance(stmt, Assignment):
+            return {stmt.target.name}
+        if isinstance(stmt, AugmentedAssignment):
+            return {stmt.target.name}
+        if isinstance(stmt, If):
+            assigned = set()
+            for inner in stmt.body:
+                assigned.update(self._assigned_names_in_stmt(inner))
+            for inner in stmt.orelse:
+                assigned.update(self._assigned_names_in_stmt(inner))
+            return assigned
+        if isinstance(stmt, ForRange):
+            assigned = set()
+            for inner in stmt.body:
+                assigned.update(self._assigned_names_in_stmt(inner))
+            return assigned
+        if isinstance(stmt, While):
+            assigned = set()
+            for inner in stmt.body:
+                assigned.update(self._assigned_names_in_stmt(inner))
+            return assigned
+        return set()
+
     def _stmt_uses_impurity(self, stmt: object) -> bool:
-        if isinstance(stmt, (Print, Raise, Append, Continue, Pass)):
+        if isinstance(stmt, (Print, Raise, Append, Break, Continue, Pass)):
             return isinstance(stmt, (Print, Append))
         if isinstance(stmt, ExprStatement):
             return self._expr_uses_impurity(stmt.expr)
@@ -695,6 +1443,8 @@ class FortranBackend:
                 or (stmt.step is not None and self._expr_uses_impurity(stmt.step))
                 or any(self._stmt_uses_impurity(inner) for inner in stmt.body)
             )
+        if isinstance(stmt, While):
+            return self._expr_uses_impurity(stmt.test) or any(self._stmt_uses_impurity(inner) for inner in stmt.body)
         return False
 
     def _emit_index_selector(self, expr: object) -> str | None:
@@ -703,8 +1453,15 @@ class FortranBackend:
             return None
         high_expr, stop_expr = match
         high_text = self._emit_expr(high_expr)
-        stop_text = self._emit_expr(stop_expr)
-        return f"{high_text}:{high_text} - ({stop_text}) + 2:-1"
+        low_expr = self._simplify_expr(
+            BinaryOp(
+                BinaryOp(high_expr, BinaryOperator.SUB, stop_expr),
+                BinaryOperator.ADD,
+                Constant(2),
+            )
+        )
+        low_text = self._emit_expr(low_expr)
+        return f"{high_text}:{low_text}:-1"
 
     def _match_reverse_range(self, expr: object) -> tuple[object, object] | None:
         if not (
@@ -725,6 +1482,8 @@ class FortranBackend:
     def _expr_uses_impurity(self, expr: object) -> bool:
         if isinstance(expr, Call):
             if expr.func in {"ac_random_init", "ac_gauss", "ac_choice_weighted", "ac_choice_no_replace", "ac_loadtxt", "ac_savetxt", "ac_fill_slice"}:
+                return True
+            if expr.func in self._functions_by_name and not self._is_pure(self._functions_by_name[expr.func]):
                 return True
             return any(self._expr_uses_impurity(arg) for arg in expr.args)
         if hasattr(expr, "__dataclass_fields__"):
@@ -817,6 +1576,41 @@ class FortranBackend:
             return f"ac_format_array({self._emit_expr(expr)})", True
         return self._emit_expr(expr), False
 
+    def _render_print_as_native_write(self, values: tuple[object, ...]) -> str | None:
+        parts: list[tuple[str, str]] = []
+        for index, value in enumerate(values):
+            if index > 0 and self._needs_print_separator(values[index - 1], value):
+                parts.append(("a", self._emit_string(" ")))
+            literal = self._literal_string_value(value)
+            if literal is not None:
+                parts.append(("a", self._emit_string(literal)))
+                continue
+            expr_type = self._expr_type(value)
+            if expr_type == ScalarType.INTEGER:
+                parts.append(("i0", self._emit_expr(value)))
+                continue
+            return None
+
+        if not parts:
+            return None
+
+        merged: list[tuple[str, str]] = []
+        literal_buffer = ""
+        for fmt, text in parts:
+            if fmt == "a":
+                literal_buffer += self._unescape_fortran_string(text)
+                continue
+            if literal_buffer:
+                merged.append(("a", self._emit_string(literal_buffer)))
+                literal_buffer = ""
+            merged.append((fmt, text))
+        if literal_buffer:
+            merged.append(("a", self._emit_string(literal_buffer)))
+
+        fmt = ", ".join(code for code, _ in merged)
+        args = ", ".join(text for _, text in merged)
+        return f'write(*, "({fmt})") {args}'
+
     def _expr_type(self, expr: object) -> object | None:
         if isinstance(expr, ValueRef):
             return self._current_symbols.get(expr.name)
@@ -862,7 +1656,9 @@ class FortranBackend:
                 return ScalarType.STRING
             if expr.func in {"size", "ac_ndim", "ac_shape_dim", "int"}:
                 return ScalarType.INTEGER
-            if expr.func in {"float", "ac_float", "abs", "min", "max", "sum", "sin", "cos", "sqrt", "exp", "log"}:
+            if expr.func in {"ac_any"}:
+                return ScalarType.LOGICAL
+            if expr.func in {"float", "ac_float", "abs", "min", "max", "sum", "sin", "cos", "sqrt", "exp", "log", "ac_norm"}:
                 return ScalarType.REAL64
             if expr.func in {
                 "ac_array",
@@ -872,6 +1668,7 @@ class FortranBackend:
                 "ac_zeros",
                 "ac_arange",
                 "ac_arange_int",
+                "ac_linspace",
                 "ac_column_stack",
                 "ac_round",
                 "ac_slice",
@@ -883,9 +1680,12 @@ class FortranBackend:
                 "ac_copy",
                 "ac_full",
                 "ac_where",
+                "ac_where_select",
                 "ac_argsort",
                 "ac_roots",
                 "ac_normal_vec",
+                "ac_uniform_vec",
+                "ac_clip",
             }:
                 first_type = self._expr_type(expr.args[0]) if expr.args else None
                 if expr.func == "ac_row" and isinstance(first_type, ArrayTypeRef):
@@ -894,8 +1694,15 @@ class FortranBackend:
                     return ArrayTypeRef(first_type.element_type, 1)
                 if expr.func == "ac_add_axis" and isinstance(first_type, ArrayTypeRef):
                     return ArrayTypeRef(first_type.element_type, first_type.rank + 1)
+                if expr.func == "ac_clip" and first_type == ScalarType.REAL64:
+                    return ScalarType.REAL64
                 if expr.func == "ac_roots":
                     return ArrayTypeRef(ScalarType.COMPLEX128, 1)
+                if expr.func == "ac_where_select":
+                    second_type = self._expr_type(expr.args[1]) if len(expr.args) > 1 else None
+                    if isinstance(second_type, ArrayTypeRef):
+                        return second_type
+                    return ScalarType.REAL64
                 if expr.func in {"ac_where", "ac_argsort"}:
                     return ArrayTypeRef(ScalarType.INTEGER, 1)
                 if expr.func == "ac_arange_int":
@@ -921,6 +1728,7 @@ class FortranBackend:
                 "ac_sub_col",
                 "ac_mul_col",
                 "ac_solve_linear",
+                "ac_solve_linear_fallback",
             }:
                 if expr.func in {
                     "ac_empty2",
@@ -935,7 +1743,7 @@ class FortranBackend:
                     "ac_mul_col",
                 }:
                     return ArrayTypeRef(ScalarType.REAL64, 2)
-                if expr.func in {"ac_empty", "ac_multivariate_normal", "ac_solve_linear"}:
+                if expr.func in {"ac_empty", "ac_multivariate_normal", "ac_solve_linear", "ac_solve_linear_fallback"}:
                     return ArrayTypeRef(ScalarType.REAL64, 1)
         return None
 
@@ -944,12 +1752,26 @@ class FortranBackend:
         original_values: tuple[object, ...],
         rendered: list[tuple[str, bool]],
     ) -> str:
-        parts: list[str] = []
+        parts: list[tuple[str, bool]] = []
         for index, ((text, _), original) in enumerate(zip(rendered, original_values, strict=True)):
             if index > 0 and self._needs_print_separator(original_values[index - 1], original):
-                parts.append(self._emit_string(" "))
-            parts.append(text)
-        return " // ".join(parts)
+                parts.append((self._emit_string(" "), True))
+            literal = self._literal_string_value(original)
+            parts.append((self._emit_string(literal), True) if literal is not None else (text, False))
+
+        combined: list[tuple[str, bool]] = []
+        literal_buffer = ""
+        for text, is_literal in parts:
+            if is_literal:
+                literal_buffer += self._unescape_fortran_string(text)
+                continue
+            if literal_buffer:
+                combined.append((self._emit_string(literal_buffer), True))
+                literal_buffer = ""
+            combined.append((text, False))
+        if literal_buffer:
+            combined.append((self._emit_string(literal_buffer), True))
+        return " // ".join(text for text, _ in combined)
 
     def _needs_print_separator(self, left: object, right: object) -> bool:
         left_text = self._literal_string_value(left)
@@ -964,6 +1786,11 @@ class FortranBackend:
         if isinstance(expr, Constant) and isinstance(expr.value, str):
             return expr.value
         return None
+
+    def _unescape_fortran_string(self, text: str) -> str:
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            return text[1:-1].replace('""', '"')
+        return text
 
     def _export_names(self, module: Module) -> list[str]:
         if module.exports:

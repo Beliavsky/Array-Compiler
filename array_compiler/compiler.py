@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .backends.fortran.bindc import BindCArtifact, FortranBindCGenerator
 from .backends.fortran.emitter import FortranBackend
+from .fortran_style import apply_fortran_style
 from .ir.module import Module
 
 
@@ -16,11 +17,11 @@ class Compiler:
     fortran_backend: FortranBackend | None = None
     fortran_bindc_generator: FortranBindCGenerator | None = None
 
-    def emit_fortran(self, module: Module) -> str:
+    def emit_fortran(self, module: Module, *, style_level: str = "full") -> str:
         backend = self.fortran_backend or FortranBackend()
-        return backend.emit(module)
+        return apply_fortran_style(backend.emit_raw(module), style_level=style_level)
 
-    def emit_fortran_library(self, module: Module, exports: list[str] | None = None) -> str:
+    def emit_fortran_library(self, module: Module, exports: list[str] | None = None, *, style_level: str = "full") -> str:
         backend = self.fortran_backend or FortranBackend()
         library_module = Module(
             name=module.name,
@@ -31,7 +32,7 @@ class Compiler:
             library_mode=True,
             diagnostics=list(module.diagnostics),
         )
-        return backend.emit(library_module)
+        return apply_fortran_style(backend.emit_raw(library_module), style_level=style_level)
 
     def emit_fortran_bindc(self, module: Module) -> BindCArtifact:
         generator = self.fortran_bindc_generator or FortranBindCGenerator()
