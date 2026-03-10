@@ -8,6 +8,7 @@ __pycache__/
 *.obj
 *.exe
 _tmp*
+commit*.bat
 temp.py
 temp.py.warnings.txt
 temp_*.txt
