@@ -1,1 +1,0 @@
-python x2f_batch.py c:\python\public_domain\github\Pure-Fortran-Examples\python_numpy_examples_1\*.py --compile --csv python_numpy_examples_1_compile.csv

@@ -12,3 +12,8 @@ commit*.bat
 temp.py
 temp.py.warnings.txt
 temp_*.txt
+*.warnings.txt
+*_p.f90
+*.p01
+python_numpy_examples_1_compile.csv
+runall.bat
