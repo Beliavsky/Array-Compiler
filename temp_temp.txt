@@ -10,5 +10,6 @@
 03/10/2026  02:37 AM               153 runall.bat
 03/10/2026  07:59 AM             1,138 commit_xpyannotate_intent.bat
 03/10/2026  08:01 AM             1,100 commit_annotator_and_readme.bat
-               7 File(s)          6,628 bytes
-               0 Dir(s)  36,832,980,992 bytes free
+03/10/2026  08:05 AM               536 commit_cleanup_tmp_files.bat
+               8 File(s)          7,164 bytes
+               0 Dir(s)  36,830,674,944 bytes free

@@ -7,3 +7,7 @@ __pycache__/
 *.o
 *.obj
 *.exe
+_tmp*
+temp.py
+temp.py.warnings.txt
+temp_*.txt

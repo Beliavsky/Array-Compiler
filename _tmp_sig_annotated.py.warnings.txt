@@ -1,8 +1,0 @@
-line 3: parameter x intent=rebound
-line 3: parameter p intent=in
-line 3: parameter q intent=in
-line 3: parameter k intent=in
-line 4: parameter mode intent=in
-line 5: parameter pacf_weight intent=in
-line 6: parameter npsi intent=rebound
-line 7: parameter seed intent=in
