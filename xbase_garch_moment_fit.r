@@ -1,3 +1,5 @@
+timing_enabled <- TRUE
+
 # xgarch_sim.r
 # simulate returns from a garch(1,1) model using base r only
 # write the simulated returns to a file
@@ -6,11 +8,21 @@
 #   2) moments of returns
 #   3) direct estimates of garch(1,1) parameters with no optimizer
 #   4) normality tests for returns and standardized residuals
+#   5) elapsed times by section if timing is enabled
 #
 # model:
 #   r_t = mu + eps_t
 #   eps_t = sqrt(sigma2_t) * z_t,   z_t ~ n(0,1)
 #   sigma2_t = omega + alpha * eps_{t-1}^2 + beta * sigma2_{t-1}
+#
+# command line arguments:
+#   1: n
+#   2: outfile
+#   3: omega
+#   4: alpha
+#   5: beta
+#   6: mu
+#   7: seed
 
 simulate_garch11 <- function(n, omega, alpha, beta, mu = 0, seed = NULL) {
   if (!is.null(seed)) {
@@ -393,10 +405,37 @@ fmt_num <- function(x, width = 12, digits = 6) {
   out
 }
 
+timer_new <- function(enabled = TRUE) {
+  list(enabled = enabled, elapsed = numeric(0))
+}
+
+timer_add <- function(timer, name, seconds) {
+  if (timer$enabled) {
+    timer$elapsed[name] <- seconds
+  }
+  timer
+}
+
+timer_print <- function(timer) {
+  if (!timer$enabled) {
+    return(invisible(NULL))
+  }
+
+  vals <- unname(timer$elapsed)
+  nms <- names(timer$elapsed)
+
+  cat("elapsed times in seconds\n")
+  cat(sprintf("%20s %12s\n", "section", "elapsed"))
+  for (i in seq_along(vals)) {
+    cat(sprintf("%20s %12.6f\n", nms[i], vals[i]))
+  }
+  cat(sprintf("%20s %12.6f\n", "total", sum(vals)))
+}
+
 main <- function() {
   args <- commandArgs(trailingOnly = TRUE)
 
-  n <- if (length(args) >= 1) as.integer(args[1]) else 100000L
+  n <- if (length(args) >= 1) as.integer(args[1]) else 1000000L
   outfile <- if (length(args) >= 2) args[2] else "garch_returns.txt"
   omega <- if (length(args) >= 3) as.numeric(args[3]) else 0.01
   alpha <- if (length(args) >= 4) as.numeric(args[4]) else 0.08
@@ -404,6 +443,9 @@ main <- function() {
   mu <- if (length(args) >= 6) as.numeric(args[6]) else 0
   seed <- if (length(args) >= 7) as.integer(args[7]) else NULL
 
+  timer <- timer_new(timing_enabled)
+
+  t0 <- proc.time()[["elapsed"]]
   sim <- simulate_garch11(
     n = n,
     omega = omega,
@@ -412,7 +454,10 @@ main <- function() {
     mu = mu,
     seed = seed
   )
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "simulate", t1 - t0)
 
+  t0 <- proc.time()[["elapsed"]]
   write.table(
     data.frame(ret = sim$ret),
     file = outfile,
@@ -420,9 +465,15 @@ main <- function() {
     col.names = TRUE,
     quote = FALSE
   )
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "write_file", t1 - t0)
 
+  t0 <- proc.time()[["elapsed"]]
   est <- fit_garch11_direct(sim$ret)
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "estimate", t1 - t0)
 
+  t0 <- proc.time()[["elapsed"]]
   sq_acf_sim <- acf_lags(sim$ret^2, 10)
   sq_acf_est <- garch11_theoretical_sq_acf(
     est$omega, est$alpha, est$beta, est$mu, 10
@@ -459,7 +510,10 @@ main <- function() {
 
   normal_ret <- normality_summary(sim$ret)
   normal_res <- normality_summary(est$residuals)
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "diagnostics", t1 - t0)
 
+  t0 <- proc.time()[["elapsed"]]
   cat("acf of squared returns\n")
   acf_labels <- c("", as.character(1:10))
   cat(paste(sprintf("%12s", acf_labels), collapse = ""), "\n", sep = "")
@@ -544,6 +598,11 @@ main <- function() {
     cat("note: true ex_kurt and true squared-return acf require a finite fourth moment\n")
     cat("      condition: 3*alpha^2 + 2*alpha*beta + beta^2 < 1\n")
   }
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "print_main_output", t1 - t0)
+
+  cat("\n")
+  timer_print(timer)
 }
 
 main()
