@@ -1,15 +1,15 @@
-# xgarch_sim.R
+# xgarch_sim.r
 # simulate returns from a garch(1,1) model using base r only
 # write the simulated returns to a file
 # print:
 #   1) acf of squared returns
 #   2) moments of returns
-#   3) moment-based estimates of garch(1,1) parameters
+#   3) direct estimates of garch(1,1) parameters with no optimizer
 #   4) normality tests for returns and standardized residuals
 #
 # model:
 #   r_t = mu + eps_t
-#   eps_t = sqrt(sigma2_t) * z_t,   z_t ~ N(0,1)
+#   eps_t = sqrt(sigma2_t) * z_t,   z_t ~ n(0,1)
 #   sigma2_t = omega + alpha * eps_{t-1}^2 + beta * sigma2_{t-1}
 
 simulate_garch11 <- function(n, omega, alpha, beta, mu = 0, seed = NULL) {
@@ -93,6 +93,10 @@ summary_stats <- function(x) {
   c(mean = m, sd = s, skew = skew, ex_kurt = ex_kurt)
 }
 
+garch11_uncond_sd <- function(omega, alpha, beta) {
+  sqrt(omega / (1 - alpha - beta))
+}
+
 garch11_theoretical_stats <- function(omega, alpha, beta, mu = 0) {
   var_ret <- omega / (1 - alpha - beta)
   den4 <- 1 - 3 * alpha^2 - 2 * alpha * beta - beta^2
@@ -100,8 +104,7 @@ garch11_theoretical_stats <- function(omega, alpha, beta, mu = 0) {
   if (den4 <= 0) {
     ex_kurt <- NA_real_
   } else {
-    kurt <- 3 * (1 - (alpha + beta)^2) / den4
-    ex_kurt <- kurt - 3
+    ex_kurt <- 6 * alpha^2 / den4
   }
 
   c(mean = mu, sd = sqrt(var_ret), skew = 0, ex_kurt = ex_kurt)
@@ -130,7 +133,8 @@ garch11_theoretical_sq_acf <- function(omega, alpha, beta, mu = 0, lag_max = 10)
   }
 
   var_ret <- omega / (1 - alpha - beta)
-  kurt <- 3 * (1 - (alpha + beta)^2) / den4
+  ex_kurt <- 6 * alpha^2 / den4
+  kurt <- ex_kurt + 3
   var_eps2 <- var_ret^2 * (kurt - 1)
 
   scale_fac <- var_eps2 / (var_eps2 + 4 * mu^2 * var_ret)
@@ -170,92 +174,129 @@ garch11_filter <- function(ret, omega, alpha, beta, mu = 0) {
   list(eps = eps, sigma2 = sigma2, z = z)
 }
 
-to_ab <- function(par) {
-  s <- 0.999 * plogis(par[1])
-  w <- plogis(par[2])
-
-  alpha <- s * w
-  beta <- s * (1 - w)
-
-  c(alpha = alpha, beta = beta)
+clip01 <- function(x, lo = 1e-6, hi = 0.999) {
+  min(max(x, lo), hi)
 }
 
-fit_garch11_mom <- function(ret, nlags = 5) {
-  if (length(ret) <= nlags) {
-    stop("need more observations than nlags")
+estimate_phi_from_sq_acf <- function(acf_sq, nratios = 4) {
+  m <- min(nratios, length(acf_sq) - 1)
+
+  if (m < 1) {
+    return(0.90)
   }
 
+  ratios <- numeric(0)
+  for (i in 1:m) {
+    if (is.finite(acf_sq[i]) &&
+        is.finite(acf_sq[i + 1]) &&
+        acf_sq[i] > 0 &&
+        acf_sq[i + 1] > 0) {
+      ratios <- c(ratios, acf_sq[i + 1] / acf_sq[i])
+    }
+  }
+
+  ratios <- ratios[is.finite(ratios) & ratios > 0 & ratios < 0.999]
+
+  if (length(ratios) == 0) {
+    return(0.90)
+  }
+
+  clip01(median(ratios), lo = 0.01, hi = 0.999)
+}
+
+estimate_alpha_from_phi_kurt <- function(phi, ex_kurt) {
+  c0 <- 1 - phi^2
+
+  if (!is.finite(phi) || !is.finite(ex_kurt) || c0 <= 0 || ex_kurt <= 0) {
+    return(NA_real_)
+  }
+
+  alpha2 <- ex_kurt * c0 / (2 * (ex_kurt + 3))
+
+  if (!is.finite(alpha2) || alpha2 <= 0) {
+    return(NA_real_)
+  }
+
+  alpha <- sqrt(alpha2)
+
+  if (alpha <= 0 || alpha >= phi) {
+    return(NA_real_)
+  }
+
+  alpha
+}
+
+estimate_alpha_from_phi_rho1 <- function(phi, rho1) {
+  c0 <- 1 - phi^2
+
+  if (!is.finite(phi) || !is.finite(rho1) || c0 <= 0 || rho1 <= 0) {
+    return(NA_real_)
+  }
+
+  acoef <- rho1 - phi
+  bcoef <- -c0
+  ccoef <- rho1 * c0
+
+  if (abs(acoef) < 1e-12) {
+    alpha <- rho1
+    if (alpha > 0 && alpha < phi) {
+      return(alpha)
+    }
+    return(NA_real_)
+  }
+
+  disc <- bcoef^2 - 4 * acoef * ccoef
+  if (!is.finite(disc) || disc < 0) {
+    return(NA_real_)
+  }
+
+  roots <- c(
+    (-bcoef + sqrt(disc)) / (2 * acoef),
+    (-bcoef - sqrt(disc)) / (2 * acoef)
+  )
+
+  roots <- roots[is.finite(roots) & roots > 0 & roots < phi]
+
+  if (length(roots) == 0) {
+    return(NA_real_)
+  }
+
+  roots[1]
+}
+
+fit_garch11_direct <- function(ret) {
   stats_target <- summary_stats(ret)
   mu_hat <- unname(stats_target["mean"])
-  var_hat <- unname(stats_target["sd"]^2)
-  ex_kurt_target <- unname(stats_target["ex_kurt"])
-  acf_target <- acf_lags(ret^2, nlags)
+  xc <- ret - mu_hat
+  var_hat <- mean(xc^2)
+  ex_kurt_hat <- unname(stats_target["ex_kurt"])
 
-  objective <- function(par) {
-    ab <- to_ab(par)
-    alpha <- unname(ab["alpha"])
-    beta <- unname(ab["beta"])
-    omega <- var_hat * (1 - alpha - beta)
+  acf_sq_centered <- acf_lags(xc^2, 10)
+  rho1_hat <- acf_sq_centered[1]
+  phi_hat <- estimate_phi_from_sq_acf(acf_sq_centered, nratios = 4)
 
-    if (!is.finite(omega) || omega <= 0) {
-      return(1e12)
-    }
+  alpha_kurt <- estimate_alpha_from_phi_kurt(phi_hat, ex_kurt_hat)
+  alpha_rho1 <- estimate_alpha_from_phi_rho1(phi_hat, rho1_hat)
 
-    theo_stats <- garch11_theoretical_stats(omega, alpha, beta, mu_hat)
-    theo_acf <- garch11_theoretical_sq_acf(omega, alpha, beta, mu_hat, nlags)
-
-    if (any(!is.finite(theo_stats)) || any(!is.finite(theo_acf))) {
-      return(1e12)
-    }
-
-    term_acf <- mean((acf_target - theo_acf)^2)
-    term_kurt <- ((ex_kurt_target - theo_stats["ex_kurt"]) /
-      (1 + abs(ex_kurt_target)))^2
-
-    term <- term_acf + term_kurt
-
-    if (!is.finite(term)) {
-      term <- 1e12
-    }
-
-    term
+  if (is.finite(alpha_kurt)) {
+    alpha_hat <- alpha_kurt
+  } else if (is.finite(alpha_rho1)) {
+    alpha_hat <- alpha_rho1
+  } else {
+    alpha_hat <- min(0.10, 0.25 * phi_hat)
   }
 
-  phi0 <- 0.90
-  if (nlags >= 2 && is.finite(acf_target[1]) && is.finite(acf_target[2]) &&
-      acf_target[1] > 0) {
-    phi0 <- min(0.98, max(0.05, acf_target[2] / acf_target[1]))
+  beta_hat <- phi_hat - alpha_hat
+
+  alpha_hat <- clip01(alpha_hat, lo = 1e-6, hi = phi_hat - 1e-6)
+  beta_hat <- clip01(beta_hat, lo = 1e-6, hi = 0.999 - alpha_hat)
+
+  if (alpha_hat + beta_hat >= 0.999) {
+    beta_hat <- 0.999 - alpha_hat
   }
 
-  s_grid <- sort(unique(c(phi0, 0.70, 0.85, 0.92, 0.97)))
-  w_grid <- c(0.05, 0.10, 0.20, 0.30, 0.40)
-
-  best <- NULL
-
-  for (s0 in s_grid) {
-    for (w0 in w_grid) {
-      p0 <- c(
-        qlogis(min(max(s0 / 0.999, 1e-6), 1 - 1e-6)),
-        qlogis(min(max(w0, 1e-6), 1 - 1e-6))
-      )
-
-      fit <- optim(
-        p0,
-        objective,
-        method = "Nelder-Mead",
-        control = list(maxit = 5000)
-      )
-
-      if (is.null(best) || fit$value < best$value) {
-        best <- fit
-      }
-    }
-  }
-
-  ab <- to_ab(best$par)
-  alpha_hat <- unname(ab["alpha"])
-  beta_hat <- unname(ab["beta"])
   omega_hat <- var_hat * (1 - alpha_hat - beta_hat)
+  omega_hat <- max(omega_hat, 1e-12)
 
   filt <- garch11_filter(ret, omega_hat, alpha_hat, beta_hat, mu_hat)
 
@@ -264,11 +305,15 @@ fit_garch11_mom <- function(ret, nlags = 5) {
     omega = omega_hat,
     alpha = alpha_hat,
     beta = beta_hat,
-    value = best$value,
+    sd_uncond = garch11_uncond_sd(omega_hat, alpha_hat, beta_hat),
     stats_target = stats_target,
-    acf_target = acf_target,
+    acf_sq_centered = acf_sq_centered,
+    rho1_hat = rho1_hat,
+    phi_hat = phi_hat,
+    alpha_kurt = alpha_kurt,
+    alpha_rho1 = alpha_rho1,
     stats_fit = garch11_theoretical_stats(omega_hat, alpha_hat, beta_hat, mu_hat),
-    acf_fit = garch11_theoretical_sq_acf(omega_hat, alpha_hat, beta_hat, mu_hat, nlags),
+    acf_fit = garch11_theoretical_sq_acf(omega_hat, alpha_hat, beta_hat, mu_hat, 10),
     sigma2 = filt$sigma2,
     eps = filt$eps,
     residuals = filt$z
@@ -339,7 +384,7 @@ fmt_num <- function(x, width = 12, digits = 6) {
 
   for (i in seq_along(x)) {
     if (is.na(x[i])) {
-      out[i] <- sprintf(paste0("%", width, "s"), "NA")
+      out[i] <- sprintf(paste0("%", width, "s"), "na")
     } else {
       out[i] <- sprintf(paste0("%", width, ".", digits, "f"), x[i])
     }
@@ -351,14 +396,13 @@ fmt_num <- function(x, width = 12, digits = 6) {
 main <- function() {
   args <- commandArgs(trailingOnly = TRUE)
 
-  n <- if (length(args) >= 1) as.integer(args[1]) else 10000L
+  n <- if (length(args) >= 1) as.integer(args[1]) else 100000L
   outfile <- if (length(args) >= 2) args[2] else "garch_returns.txt"
   omega <- if (length(args) >= 3) as.numeric(args[3]) else 0.01
   alpha <- if (length(args) >= 4) as.numeric(args[4]) else 0.08
   beta <- if (length(args) >= 5) as.numeric(args[5]) else 0.90
   mu <- if (length(args) >= 6) as.numeric(args[6]) else 0
   seed <- if (length(args) >= 7) as.integer(args[7]) else NULL
-  nlags_fit <- if (length(args) >= 8) as.integer(args[8]) else 5L
 
   sim <- simulate_garch11(
     n = n,
@@ -377,7 +421,7 @@ main <- function() {
     quote = FALSE
   )
 
-  est <- fit_garch11_mom(sim$ret, nlags = nlags_fit)
+  est <- fit_garch11_direct(sim$ret)
 
   sq_acf_sim <- acf_lags(sim$ret^2, 10)
   sq_acf_est <- garch11_theoretical_sq_acf(
@@ -401,20 +445,22 @@ main <- function() {
     mu = est$mu,
     omega = est$omega,
     alpha = est$alpha,
-    beta = est$beta
+    beta = est$beta,
+    sd_uncond = est$sd_uncond
   )
   param_true <- c(
     mu = mu,
     omega = omega,
     alpha = alpha,
-    beta = beta
+    beta = beta,
+    sd_uncond = garch11_uncond_sd(omega, alpha, beta)
   )
   param_diff <- param_est - param_true
 
   normal_ret <- normality_summary(sim$ret)
   normal_res <- normality_summary(est$residuals)
 
-  cat("ACF of squared returns\n")
+  cat("acf of squared returns\n")
   acf_labels <- c("", as.character(1:10))
   cat(paste(sprintf("%12s", acf_labels), collapse = ""), "\n", sep = "")
   cat(sprintf("%12s", "simulated"),
@@ -449,8 +495,8 @@ main <- function() {
 
   cat("\n")
 
-  param_labels <- c("", "mu", "omega", "alpha", "beta")
-  cat("Estimated GARCH(1,1) parameters\n")
+  param_labels <- c("", "mu", "omega", "alpha", "beta", "sd_uncond")
+  cat("estimated garch(1,1) parameters\n")
   cat(paste(sprintf("%12s", param_labels), collapse = ""), "\n", sep = "")
   cat(sprintf("%12s", "estimated"),
       paste(fmt_num(param_est), collapse = ""),
@@ -465,8 +511,8 @@ main <- function() {
   cat("\n")
 
   norm_labels <- c("", "jb_stat", "jb_p", "sw_w", "sw_p", "skew", "ex_kurt")
-  cat("Normality tests\n")
-  cat("(residuals are standardized residuals from the estimated GARCH model)\n")
+  cat("normality tests\n")
+  cat("(residuals are standardized residuals from the direct garch estimate)\n")
   cat(paste(sprintf("%12s", norm_labels), collapse = ""), "\n", sep = "")
   cat(sprintf("%12s", "returns"),
       paste(fmt_num(normal_ret), collapse = ""),
@@ -476,9 +522,20 @@ main <- function() {
       "\n", sep = "")
 
   cat("\n")
-  cat("moment fit used mean, sd, ex_kurt, and lags 1 to", nlags_fit,
-      "of the acf of squared returns\n")
-  cat("objective =", sprintf("%.6f", est$value), "\n")
+  cat("direct estimator details\n")
+  detail_labels <- c("", "rho1_sq", "phi", "alpha_kurt", "alpha_rho1")
+  detail_vals <- c(
+    est$rho1_hat,
+    est$phi_hat,
+    est$alpha_kurt,
+    est$alpha_rho1
+  )
+  cat(paste(sprintf("%12s", detail_labels), collapse = ""), "\n", sep = "")
+  cat(sprintf("%12s", "estimate"),
+      paste(fmt_num(detail_vals), collapse = ""),
+      "\n", sep = "")
+
+  cat("\n")
   cat("wrote", n, "returns to", outfile, "\n")
   cat("omega =", omega, "alpha =", alpha, "beta =", beta,
       "mu =", mu, "seed =", seed, "\n")
