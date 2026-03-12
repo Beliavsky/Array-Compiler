@@ -16,6 +16,7 @@ from pathlib import Path
 
 from array_compiler.compiler import Compiler
 from array_compiler.frontends.python_numpy import PythonNumpyFrontend
+from array_compiler.frontends.r import RSubsetFrontend
 from array_compiler.backends.fortran.helpers import HelperRegistry
 from array_compiler.fortran_style import STYLE_LEVELS
 from array_compiler.ir.nodes import Function
@@ -23,24 +24,28 @@ from array_compiler.ir.nodes import Function
 
 HELPER_MODULE_KEYS = {
     "kind_mod": "kind_mod",
+    "ac_constants_mod": "ac_constants",
     "ac_string_mod": "ac_string",
     "ac_random_support": "ac_random",
     "ac_numpy_mod": "ac_numpy",
+    "ac_lapack_mod": "ac_lapack",
 }
 
-HELPER_ORDER = ["kind_mod", "ac_string", "ac_random", "ac_numpy", "lapack_d", "python", "octave_funcs", "r"]
+HELPER_ORDER = ["kind_mod", "ac_constants", "ac_string", "ac_random", "ac_numpy", "ac_lapack", "lapack_d", "python", "octave_funcs", "r"]
 HELPER_DEPENDENCIES = {
     "ac_numpy": {"ac_random"},
+    "ac_lapack": {"lapack_d"},
 }
 HELPER_MOD_FILES = {
     "kind_mod": "kind_mod.mod",
+    "ac_constants": "ac_constants_mod.mod",
     "ac_string": "ac_string_mod.mod",
     "ac_random": "ac_random_support.mod",
     "ac_numpy": "ac_numpy_mod.mod",
 }
-HELPER_CACHE_FORMAT_VERSION = "v2"
+HELPER_CACHE_FORMAT_VERSION = "v4"
 
-DEFAULT_GFORTRAN_COMPILER = "gfortran -O3 -march=native -flto -Wfatal-errors"
+DEFAULT_GFORTRAN_COMPILER = "gfortran -O3 -march=native -flto -Wfatal-errors -Werror"
 DEFAULT_IFX_COMPILER_WINDOWS = "ifx /O3"
 DEFAULT_IFX_COMPILER_POSIX = "ifx -O3"
 
@@ -96,8 +101,9 @@ def build_driver_source(module_name: str, entry_name: str) -> str:
     return "\n".join(
         [
             f"program {module_name}_driver",
-            f"use {module_name}, only: {entry_name}",
+            f"use {module_name}, only: ac_init_argv, {entry_name}",
             "implicit none",
+            "call ac_init_argv()",
             f"call {entry_name}()",
             f"end program {module_name}_driver",
             "",
@@ -194,14 +200,44 @@ def compare_outputs(python_stdout: str, fortran_stdout: str, *, stochastic: bool
     return False
 
 
-def transpile_python_to_fortran(input_path: Path, output_path: Path, *, style_level: str = "full"):
+def detect_source_language(input_path: Path) -> str:
+    suffix = input_path.suffix
+    if suffix == ".py":
+        return "python"
+    if suffix in {".r", ".R"}:
+        return "r"
+    raise ValueError(f"unsupported source suffix {suffix!r}; expected .py, .r, or .R")
+
+
+def frontend_for_language(language: str):
+    if language == "python":
+        return PythonNumpyFrontend()
+    if language == "r":
+        return RSubsetFrontend()
+    raise ValueError(f"unsupported source language {language!r}")
+
+
+def transpile_source_to_fortran(input_path: Path, output_path: Path, *, style_level: str = "full"):
     source = input_path.read_text(encoding="utf-8-sig")
     module_name = output_path.stem
-    frontend = PythonNumpyFrontend()
+    frontend = frontend_for_language(detect_source_language(input_path))
     module = frontend.lower_source(source, module_name=module_name)
     fortran_source = Compiler().emit_fortran(module, style_level=style_level)
     output_path.write_text(fortran_source, encoding="utf-8")
     return module, fortran_source
+
+
+def transpile_python_to_fortran(input_path: Path, output_path: Path, *, style_level: str = "full"):
+    return transpile_source_to_fortran(input_path, output_path, style_level=style_level)
+
+
+def source_run_command(input_path: Path) -> list[str]:
+    language = detect_source_language(input_path)
+    if language == "python":
+        return [sys.executable, str(input_path)]
+    if language == "r":
+        return ["Rscript", str(input_path)]
+    raise ValueError(f"unsupported source language {language!r}")
 
 
 def default_ifx_compiler() -> str:
@@ -328,13 +364,14 @@ def ensure_cached_helpers(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Translate Python to Fortran with optional compile/run timing")
-    parser.add_argument("input_py", nargs="?", help="Python source file")
+    parser = argparse.ArgumentParser(description="Translate Python or restricted R to Fortran with optional compile/run timing")
+    parser.add_argument("input_py", nargs="?", help="Source file (.py, .r, .R)")
     parser.add_argument("--out", help="Output Fortran file")
     parser.add_argument("--compile", action="store_true", help="Compile generated Fortran")
     parser.add_argument("--run", action="store_true", help="Compile and run generated Fortran")
     parser.add_argument("--run-both", action="store_true", help="Run Python, transpile, compile, and run Fortran without timings or diff")
     parser.add_argument("--time-both", action="store_true", help="Run Python, transpile, compile, run Fortran, and print timings")
+    parser.add_argument("--print-main", action="store_true", help="Print the generated temporary driver program")
     parser.add_argument("--tee", action="store_true", help="Print the generated Fortran source after transpilation")
     parser.add_argument("--compiler", help="Compiler command")
     parser.add_argument("--ifx", action="store_true", help="Use the Intel Fortran compiler preset")
@@ -376,13 +413,13 @@ def main() -> int:
     python_rc = 0
 
     if args.time_both or args.run_both:
-        py_cmd = [sys.executable, str(input_path)]
-        print("Run (python):", format_command(py_cmd))
+        py_cmd = source_run_command(input_path)
+        print(f"Run ({detect_source_language(input_path)}):", format_command(py_cmd))
         t0 = time.perf_counter()
         python_rc, python_stdout, python_stderr = run_capture(py_cmd, cwd=input_path.parent)
         timings["python run"] = time.perf_counter() - t0
         if python_rc != 0:
-            print(f"Run (python): FAIL (exit {python_rc})")
+            print(f"Run ({detect_source_language(input_path)}): FAIL (exit {python_rc})")
             if python_stdout.strip():
                 print(python_stdout.rstrip())
             if python_stderr.strip():
@@ -390,7 +427,7 @@ def main() -> int:
             if args.time_both:
                 emit_timing_summary(timings)
             return python_rc
-        print("Run (python): PASS")
+        print(f"Run ({detect_source_language(input_path)}): PASS")
         if python_stdout.strip():
             print(python_stdout.rstrip())
         if python_stderr.strip():
@@ -398,7 +435,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     try:
-        module, fortran_source = transpile_python_to_fortran(input_path, output_path, style_level=args.style_level)
+        module, fortran_source = transpile_source_to_fortran(input_path, output_path, style_level=args.style_level)
     except Exception as exc:  # pragmatic CLI surface for now
         timings["transpile"] = time.perf_counter() - t0
         print(f"Transpile failed: {exc}")
@@ -444,8 +481,14 @@ def main() -> int:
         local_output_path = build_dir / output_path.name
         exe_path = output_path.with_suffix(".exe")
         local_output_path.write_text(fortran_source, encoding="utf-8")
+        driver_source = ""
         if entry_name:
-            driver_path.write_text(build_driver_source(output_path.stem, entry_name), encoding="utf-8")
+            driver_source = build_driver_source(output_path.stem, entry_name)
+            driver_path.write_text(driver_source, encoding="utf-8")
+            if args.print_main:
+                print(driver_source.rstrip())
+        elif args.print_main:
+            print("No generated main program.")
 
         build_cmd = build_command(
             compiler_parts=compiler_parts,

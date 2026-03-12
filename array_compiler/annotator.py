@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 TYPE_IMPORT = "from typing import Final"
 ARRAY_IMPORT = "from array_compiler.annotations import Array1D, Array2D, Array3D"
+GENERATED_COMMENT_PREFIX = "xpyannotate:"
+READONLY_ARRAY_COMMENT = f"{GENERATED_COMMENT_PREFIX} readonly-array"
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class PythonAnnotator:
             known={},
             scope="<module>",
         )
+        mutated_names_by_scope = self._collect_mutated_names_by_scope(tree.body)
         self._known_name_types = {name: info.text for name, info in assigned_types.items()}
         self._known_function_arg_types = {
             node.name: {
@@ -62,17 +65,22 @@ class PythonAnnotator:
             inferred_return, return_warning = self._infer_return_annotation(node, inferred_args)
             if return_warning is not None:
                 warnings.append(return_warning)
+            function_comment = None
+            if infer_intent:
+                function_comment = self._format_intent_comment(node)
             if not inferred_args and inferred_return is None:
-                continue
+                if function_comment is None:
+                    continue
             signature_end_lineno = self._signature_end_lineno(node)
-            replacements[node.lineno] = self._rewrite_function_signature(
+            replacement_end, replacement_lines = self._rewrite_function_signature(
                 lines[node.lineno - 1:signature_end_lineno],
                 node,
                 inferred_args=inferred_args,
                 inferred_return=inferred_return,
             )
-            if infer_intent:
-                warnings.extend(self._infer_parameter_intents(node))
+            if function_comment is not None:
+                replacement_lines = [function_comment, *replacement_lines]
+            replacements[node.lineno] = (replacement_end, replacement_lines)
             self._known_function_arg_types[node.name] = {
                 arg.arg: (ast.unparse(arg.annotation) if arg.annotation is not None else inferred_args.get(arg.arg))
                 for arg in node.args.args
@@ -100,6 +108,14 @@ class PythonAnnotator:
                 continue
             assignment_key = assignment_keys.get(node.lineno)
             is_final = assignment_key is not None and len(assigned_lines.get(assignment_key, [])) == 1
+            scope = assignment_key[0] if assignment_key is not None else "<module>"
+            generated_comment = None
+            if (
+                is_final
+                and self._is_array_annotation_text(info.text)
+                and target not in mutated_names_by_scope.get(scope, set())
+            ):
+                generated_comment = READONLY_ARRAY_COMMENT
             line = lines[node.lineno - 1]
             replacements[node.lineno] = (
                 node.lineno,
@@ -109,6 +125,7 @@ class PythonAnnotator:
                         target=target,
                         annotation_text=info.text,
                         is_final=is_final,
+                        generated_comment=generated_comment,
                     )
                 ],
             )
@@ -127,9 +144,13 @@ class PythonAnnotator:
         return "\n".join(rewritten_lines) + ("\n" if source.endswith("\n") else ""), warnings
 
     def _infer_parameter_intents(self, node: ast.FunctionDef) -> list[WarningInfo]:
+        intent_map = self._infer_parameter_intent_map(node)
+        return [WarningInfo(line=arg.lineno, message=f"parameter {arg.arg} intent={intent_map[arg.arg]}") for arg in node.args.args]
+
+    def _infer_parameter_intent_map(self, node: ast.FunctionDef) -> dict[str, str]:
         params = {arg.arg for arg in node.args.args}
         if not params:
-            return []
+            return {}
         rebound: set[str] = set()
         mutated: set[str] = set()
         for child in ast.walk(node):
@@ -149,15 +170,28 @@ class PythonAnnotator:
                         rebound.add(item.optional_vars.id)
             elif isinstance(child, ast.Call):
                 self._classify_mutating_call(child, params, mutated)
-        warnings: list[WarningInfo] = []
+        intent_map: dict[str, str] = {}
         for arg in node.args.args:
             intent = "in"
             if arg.arg in mutated:
                 intent = "mutated"
             elif arg.arg in rebound:
                 intent = "rebound"
-            warnings.append(WarningInfo(line=arg.lineno, message=f"parameter {arg.arg} intent={intent}"))
-        return warnings
+            intent_map[arg.arg] = intent
+        return intent_map
+
+    def _format_intent_comment(self, node: ast.FunctionDef) -> str | None:
+        intent_map = self._infer_parameter_intent_map(node)
+        if not intent_map:
+            return None
+        label_map = {
+            "in": "in",
+            "mutated": "inout",
+            "rebound": "local-rebind",
+        }
+        pieces = [f"{arg.arg}={label_map[intent_map[arg.arg]]}" for arg in node.args.args]
+        indent = self._source.splitlines()[node.lineno - 1][: len(self._source.splitlines()[node.lineno - 1]) - len(self._source.splitlines()[node.lineno - 1].lstrip())]
+        return f"{indent}# {GENERATED_COMMENT_PREFIX} intent " + ", ".join(pieces)
 
     def _classify_target(self, target: ast.expr, params: set[str], rebound: set[str], mutated: set[str]) -> None:
         if isinstance(target, ast.Name) and target.id in params:
@@ -174,6 +208,54 @@ class PythonAnnotator:
         if not isinstance(call.func.value, ast.Name):
             return
         if call.func.value.id not in params:
+            return
+        if call.func.attr in {"append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse", "fill", "resize", "shuffle"}:
+            mutated.add(call.func.value.id)
+
+    def _collect_mutated_names_by_scope(self, stmts: list[ast.stmt], scope: str = "<module>") -> dict[str, set[str]]:
+        mutated_by_scope: dict[str, set[str]] = {scope: set()}
+        for stmt in stmts:
+            if isinstance(stmt, ast.FunctionDef):
+                child_mutations = self._collect_mutated_names_by_scope(stmt.body, stmt.name)
+                for child_scope, names in child_mutations.items():
+                    mutated_by_scope.setdefault(child_scope, set()).update(names)
+                continue
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    self._collect_mutated_target_names(target, mutated_by_scope[scope])
+            elif isinstance(stmt, ast.AnnAssign):
+                self._collect_mutated_target_names(stmt.target, mutated_by_scope[scope])
+            elif isinstance(stmt, ast.AugAssign):
+                self._collect_mutated_target_names(stmt.target, mutated_by_scope[scope])
+            elif isinstance(stmt, ast.Call):
+                self._collect_mutating_call_names(stmt, mutated_by_scope[scope])
+            for child_scope_stmts in self._nested_stmt_lists(stmt):
+                child_mutations = self._collect_mutated_names_by_scope(child_scope_stmts, scope)
+                mutated_by_scope[scope].update(child_mutations.get(scope, set()))
+        return mutated_by_scope
+
+    def _nested_stmt_lists(self, stmt: ast.stmt) -> list[list[ast.stmt]]:
+        nested: list[list[ast.stmt]] = []
+        for attr in ("body", "orelse", "finalbody"):
+            value = getattr(stmt, attr, None)
+            if isinstance(value, list):
+                nested.append(value)
+        if isinstance(stmt, ast.Try):
+            nested.extend(handler.body for handler in stmt.handlers)
+        return nested
+
+    def _collect_mutated_target_names(self, target: ast.expr, mutated: set[str]) -> None:
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            mutated.add(target.value.id)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._collect_mutated_target_names(elt, mutated)
+
+    def _collect_mutating_call_names(self, call: ast.Call, mutated: set[str]) -> None:
+        if not isinstance(call.func, ast.Attribute):
+            return
+        if not isinstance(call.func.value, ast.Name):
             return
         if call.func.attr in {"append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse", "fill", "resize", "shuffle"}:
             mutated.add(call.func.value.id)
@@ -494,7 +576,15 @@ class PythonAnnotator:
         left = stripped.split("=", 1)[0]
         return ":" in left
 
-    def _rewrite_assignment_line(self, line: str, *, target: str, annotation_text: str, is_final: bool) -> str:
+    def _rewrite_assignment_line(
+        self,
+        line: str,
+        *,
+        target: str,
+        annotation_text: str,
+        is_final: bool,
+        generated_comment: str | None = None,
+    ) -> str:
         before, sep, after = line.partition("=")
         if not sep:
             return line
@@ -503,9 +593,19 @@ class PythonAnnotator:
             name_part, _, _existing = stripped_before.partition(":")
             indent = before[: len(before) - len(before.lstrip())]
             type_text = f"Final[{annotation_text}]" if is_final else annotation_text
-            return f"{indent}{name_part.strip()}: {type_text} = {after.lstrip()}"
+            rewritten = f"{indent}{name_part.strip()}: {type_text} = {after.lstrip()}"
+            return self._append_generated_comment(rewritten, generated_comment)
         annotation = f"{target}: Final[{annotation_text}] = " if is_final else f"{target}: {annotation_text} = "
-        return line.replace(f"{target} = ", annotation, 1)
+        rewritten = line.replace(f"{target} = ", annotation, 1)
+        return self._append_generated_comment(rewritten, generated_comment)
+
+    def _append_generated_comment(self, line: str, generated_comment: str | None) -> str:
+        if generated_comment is None or generated_comment in line:
+            return line
+        return f"{line}  # {generated_comment}"
+
+    def _is_array_annotation_text(self, text: str) -> bool:
+        return text.startswith("Array1D[") or text.startswith("Array2D[") or text.startswith("Array3D[")
 
     def _infer_annotation(self, expr: ast.AST) -> AnnotationInfo | None:
         if isinstance(expr, ast.Constant):

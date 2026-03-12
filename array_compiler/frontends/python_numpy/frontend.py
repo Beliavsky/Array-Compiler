@@ -7,6 +7,7 @@ structured return values suitable for option-pricing examples.
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import tokenize
 from dataclasses import dataclass, field
@@ -62,9 +63,11 @@ class PythonNumpyFrontend:
     _current_function: str | None = field(default=None, init=False)
     _current_symbols: dict[str, object] = field(default_factory=dict, init=False)
     _current_dtypes: dict[str, str] = field(default_factory=dict, init=False)
+    _current_contiguity: dict[str, tuple[bool, bool]] = field(default_factory=dict, init=False)
     _source_lines: list[str] = field(default_factory=list, init=False)
     _comment_lines: dict[int, str] = field(default_factory=dict, init=False)
     _used_comment_lines: set[int] = field(default_factory=set, init=False)
+    _function_nodes: dict[str, ast.FunctionDef] = field(default_factory=dict, init=False)
 
     def lower_source(self, source: str, module_name: str = "translated_module") -> Module:
         if source.startswith("\ufeff"):
@@ -78,9 +81,11 @@ class PythonNumpyFrontend:
         self._function_arg_types = {}
         self._function_arg_names = {}
         self._record_defs = {}
+        self._function_nodes = {}
         self._current_function = None
         self._current_symbols = {}
         self._current_dtypes = {}
+        self._current_contiguity = {}
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -131,6 +136,7 @@ class PythonNumpyFrontend:
         return Program(name="run_main", locals=list(locals_map.items()), body=body, leading_comments=leading_comments)
 
     def _register_function_signature(self, node: ast.FunctionDef) -> None:
+        self._function_nodes[node.name] = node
         result_type = self._map_annotation(node.returns, node.name)
         if result_type is None:
             result_type = self._infer_result_type_from_returns(node)
@@ -155,6 +161,41 @@ class PythonNumpyFrontend:
                 return self._infer_type(stmt.value)
         return None
 
+    def _infer_user_call_result_type(self, function_name: str, actual_args: list[ast.AST]) -> object | None:
+        node = self._function_nodes.get(function_name)
+        if node is None:
+            return self._function_result_types.get(function_name)
+
+        saved_symbols = self._current_symbols
+        saved_function = self._current_function
+        try:
+            arg_types = list(self._function_arg_types.get(function_name, []))
+            if not arg_types:
+                arg_types = [self._map_annotation(arg.annotation, function_name) or ScalarType.REAL64 for arg in node.args.args]
+            symbols: dict[str, object] = {}
+            for index, arg in enumerate(node.args.args):
+                actual_type = self._infer_type(actual_args[index]) if index < len(actual_args) else None
+                formal_type = arg_types[index] if index < len(arg_types) else None
+                symbols[arg.arg] = self._merge_types(formal_type, actual_type) or formal_type or actual_type or ScalarType.REAL64
+            self._current_symbols = symbols
+            self._current_function = function_name
+            refined: object | None = self._function_result_types.get(function_name)
+            for stmt in node.body:
+                if self._is_docstring(stmt):
+                    continue
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    inferred_value = self._infer_type(stmt.value)
+                    self._current_symbols[stmt.targets[0].id] = inferred_value
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                    inferred_value = self._map_annotation(stmt.annotation, function_name) or self._infer_type(stmt.value)
+                    self._current_symbols[stmt.target.id] = inferred_value
+                if isinstance(stmt, ast.Return) and stmt.value is not None:
+                    refined = self._merge_types(refined, self._infer_type(stmt.value))
+            return refined
+        finally:
+            self._current_symbols = saved_symbols
+            self._current_function = saved_function
+
     def _lower_function(self, node: ast.FunctionDef) -> Function:
         self._current_function = node.name
         locals_map: dict[str, object] = {}
@@ -164,14 +205,16 @@ class PythonNumpyFrontend:
         self._update_function_defaults(node, dict(args))
         self._current_symbols = {name: typ for name, typ in args}
         self._current_dtypes = {}
-        for stmt in node.body:
+        self._current_contiguity = {}
+        lowered_stmts = self._normalize_stmt_sequence(node.body)
+        for stmt in lowered_stmts:
             self._collect_locals(stmt, locals_map)
         arg_names = {name for name, _ in args}
         locals_list = [(name, typ) for name, typ in locals_map.items() if name not in arg_names]
         self._current_symbols.update(locals_list)
         body: list[object] = []
         leading_comments = self._function_leading_comments(node)
-        for stmt in node.body:
+        for stmt in lowered_stmts:
             if self._is_docstring(stmt):
                 continue
             body.extend(Comment(text) for text in self._attached_comments_before_stmt(stmt, node.lineno))
@@ -190,7 +233,72 @@ class PythonNumpyFrontend:
         self._current_function = None
         self._current_symbols = {}
         self._current_dtypes = {}
+        self._current_contiguity = {}
         return function
+
+    def _normalize_stmt_sequence(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
+        normalized: list[ast.stmt] = []
+        index = 0
+        while index < len(stmts):
+            stmt = stmts[index]
+            next_stmt = stmts[index + 1] if index + 1 < len(stmts) else None
+            collapsed = self._collapse_rank_normalization_pair(stmt, next_stmt)
+            if collapsed is not None:
+                normalized.append(collapsed)
+                index += 2
+                continue
+            normalized.append(stmt)
+            index += 1
+        return normalized
+
+    def _collapse_rank_normalization_pair(self, first: ast.stmt, second: ast.stmt | None) -> ast.stmt | None:
+        if second is None:
+            return None
+        if not (
+            isinstance(first, ast.Assign)
+            and len(first.targets) == 1
+            and isinstance(first.targets[0], ast.Name)
+            and isinstance(second, ast.Assign)
+            and len(second.targets) == 1
+            and isinstance(second.targets[0], ast.Name)
+            and first.targets[0].id == second.targets[0].id
+        ):
+            return None
+        target_name = first.targets[0].id
+        value = second.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "reshape"
+            and isinstance(value.func.value, ast.Call)
+            and isinstance(value.func.value.func, ast.Attribute)
+            and self._attr_chain(value.func.value.func) == ["np", "asarray"]
+            and value.func.value.args
+            and isinstance(value.func.value.args[0], ast.Name)
+            and value.func.value.args[0].id == target_name
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.UnaryOp)
+            and isinstance(value.args[0].op, ast.USub)
+            and isinstance(value.args[0].operand, ast.Constant)
+            and value.args[0].operand.value == 1
+        ):
+            return None
+        replacement = copy.deepcopy(second)
+        assert isinstance(replacement, ast.Assign)
+        reshape_call = replacement.value
+        assert isinstance(reshape_call, ast.Call)
+        asarray_call = reshape_call.func.value
+        assert isinstance(asarray_call, ast.Call)
+        if isinstance(first.value, ast.Call) and isinstance(first.value.func, ast.Attribute):
+            if self._attr_chain(first.value.func) == ["np", "loadtxt"]:
+                replacement.value = ast.Call(
+                    func=ast.Name(id="ac_loadtxt_1d", ctx=ast.Load()),
+                    args=[copy.deepcopy(arg) for arg in first.value.args],
+                    keywords=[],
+                )
+                return replacement
+        asarray_call.args[0] = copy.deepcopy(first.value)
+        return replacement
 
     def _update_function_defaults(self, node: ast.FunctionDef, arg_types: dict[str, object]) -> None:
         defaults: list[object | None] = [None] * len(node.args.args)
@@ -332,6 +440,10 @@ class PythonNumpyFrontend:
                     if chain == ["np", "asarray"] and stmt.args and isinstance(stmt.args[0], ast.Name):
                         self._merge_arg_type(arg_types, stmt.args[0].id, ArrayTypeRef(ScalarType.REAL64, 1))
                         sequence_like_names.add(stmt.args[0].id)
+                    if chain == ["np", "linspace"] and len(stmt.args) >= 3:
+                        self._collect_integer_like_names(stmt.args[2], integer_like_names)
+                    if chain == ["np", "loadtxt"] and stmt.args and isinstance(stmt.args[0], ast.Name):
+                        arg_types[stmt.args[0].id] = ScalarType.STRING
                     if stmt.func.attr == "normal" and chain[:1] != ["np"]:
                         size_expr = self._keyword_value(stmt, "size")
                         if size_expr is not None:
@@ -366,6 +478,15 @@ class PythonNumpyFrontend:
                     inferred_local = None
                 if inferred_local is not None:
                     local_types[stmt.targets[0].id] = inferred_local
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Tuple)
+                and isinstance(stmt.value, ast.Name)
+                and stmt.value.id in {item.arg for item in node.args.args}
+            ):
+                if self._merge_arg_type(arg_types, stmt.value.id, ArrayTypeRef(ScalarType.REAL64, 1)):
+                    sequence_like_names.add(stmt.value.id)
             if (
                 isinstance(stmt, ast.For)
                 and isinstance(stmt.iter, ast.Name)
@@ -425,11 +546,14 @@ class PythonNumpyFrontend:
                         and stmt.value.args
                         and isinstance(stmt.value.args[0], ast.Name)
                     ):
-                        aliases[target_name] = stmt.value.args[0].id
-                        if self._set_array_rank(arg_types, aliases, stmt.value.args[0].id, 1):
-                            changed = True
-                        if self._set_array_rank(arg_types, aliases, target_name, 1):
-                            changed = True
+                        source_name = stmt.value.args[0].id
+                        aliases[target_name] = source_name
+                        source_type = arg_types.get(source_name)
+                        target_type = arg_types.get(target_name)
+                        if isinstance(source_type, ArrayTypeRef):
+                            changed |= self._merge_arg_type(arg_types, target_name, source_type)
+                        if isinstance(target_type, ArrayTypeRef):
+                            changed |= self._merge_arg_type(arg_types, source_name, target_type)
                     if (
                         isinstance(stmt.value, ast.Call)
                         and isinstance(stmt.value.func, ast.Attribute)
@@ -458,10 +582,30 @@ class PythonNumpyFrontend:
                         if arg_types.get(stmt.args[0].id) != ScalarType.STRING:
                             arg_types[stmt.args[0].id] = ScalarType.STRING
                             changed = True
+                    if chain == ["np", "loadtxt"] and stmt.args and isinstance(stmt.args[0], ast.Name):
+                        if arg_types.get(stmt.args[0].id) != ScalarType.STRING:
+                            arg_types[stmt.args[0].id] = ScalarType.STRING
+                            changed = True
                     if chain == ["np", "random", "default_rng"] and stmt.args and isinstance(stmt.args[0], ast.Name):
                         if arg_types.get(stmt.args[0].id) != ScalarType.INTEGER:
                             arg_types[stmt.args[0].id] = ScalarType.INTEGER
                             changed = True
+                    if tuple(chain) in {
+                        ("np", "linalg", "cholesky"),
+                        ("np", "linalg", "det"),
+                        ("np", "linalg", "eig"),
+                        ("np", "linalg", "inv"),
+                        ("np", "linalg", "svd"),
+                    } and stmt.args and isinstance(stmt.args[0], ast.Name):
+                        if self._set_array_rank(arg_types, aliases, stmt.args[0].id, 2):
+                            changed = True
+                    if chain == ["np", "linalg", "solve"] and stmt.args:
+                        if isinstance(stmt.args[0], ast.Name):
+                            if self._set_array_rank(arg_types, aliases, stmt.args[0].id, 2):
+                                changed = True
+                        if len(stmt.args) > 1 and isinstance(stmt.args[1], ast.Name):
+                            if self._set_array_rank(arg_types, aliases, stmt.args[1].id, 1):
+                                changed = True
                     if stmt.func.attr == "choice":
                         size_expr = self._keyword_value(stmt, "size")
                         if isinstance(size_expr, ast.Name) and arg_types.get(size_expr.id) != ScalarType.INTEGER:
@@ -602,10 +746,27 @@ class PythonNumpyFrontend:
         if isinstance(expr, Call):
             if expr.func in self._function_result_types:
                 return self._function_result_types[expr.func]
+            if expr.func == "ac_array_literal":
+                if not expr.args:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                first_type = self._infer_ir_type(expr.args[0])
+                if isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, rank=first_type.rank + 1)
+                element_type = first_type if first_type is not None else ScalarType.REAL64
+                return ArrayTypeRef(element_type)
+            if expr.func == "ac_array":
+                if not expr.args:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return self._infer_ir_type(expr.args[0])
             if expr.func == "ac_empty":
                 return ArrayTypeRef(ScalarType.REAL64)
             if expr.func == "ac_empty2":
                 return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if expr.func == "ac_full":
+                fill_type = self._infer_ir_type(expr.args[-1]) if expr.args else ScalarType.REAL64
+                element_type = fill_type.element_type if isinstance(fill_type, ArrayTypeRef) else fill_type
+                rank = 2 if len(expr.args) == 3 else 1
+                return ArrayTypeRef(element_type, rank=rank)
             if expr.func == "ac_where":
                 return ArrayTypeRef(ScalarType.INTEGER)
             if expr.func == "ac_multivariate_normal":
@@ -628,8 +789,30 @@ class PythonNumpyFrontend:
                 return ScalarType.REAL64
             if expr.func == "ac_mean":
                 return ScalarType.REAL64
+            if expr.func in {"ac_sum_axis", "ac_mean_axis", "ac_min_axis", "ac_max_axis"}:
+                return ArrayTypeRef(ScalarType.REAL64)
             if expr.func == "ac_solve_linear":
                 return ArrayTypeRef(ScalarType.REAL64)
+            if expr.func == "ac_cholesky":
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if expr.func == "ac_file_exists":
+                return ScalarType.LOGICAL
+            if expr.func == "ac_parse_int":
+                return ScalarType.INTEGER
+            if expr.func == "ac_parse_real":
+                return ScalarType.REAL64
+            if expr.func == "ac_wall_time":
+                return ScalarType.REAL64
+            if expr.func in {"trim", "adjustl", "ac_lower", "ac_format_default", "ac_format_fixed", "ac_format_scientific", "ac_format_int"}:
+                return ScalarType.STRING
+            if expr.func == "str":
+                return ScalarType.STRING
+            if expr.func == "int":
+                return ScalarType.INTEGER
+            if expr.func == "float":
+                return ScalarType.REAL64
+            if expr.func == "ac_slice2":
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
             if expr.func == "abs" and expr.args:
                 arg_type = self._infer_ir_type(expr.args[0])
                 if isinstance(arg_type, ArrayTypeRef):
@@ -658,7 +841,13 @@ class PythonNumpyFrontend:
         if isinstance(expr, FieldAccess):
             base_type = self._infer_ir_type(expr.value)
             if isinstance(base_type, RecordTypeRef):
-                return self._tuple_item_type(base_type, int(expr.field.removeprefix("item")))
+                if expr.field.startswith("item"):
+                    return self._tuple_item_type(base_type, int(expr.field.removeprefix("item")))
+                record = self._record_defs.get(base_type.name)
+                if record is not None:
+                    for field_name, field_type in record.fields:
+                        if field_name == expr.field:
+                            return field_type
         return ScalarType.REAL64
 
     def _collect_locals(self, stmt: ast.stmt, locals_map: dict[str, object]) -> None:
@@ -667,12 +856,30 @@ class PythonNumpyFrontend:
             self._collect_expr_locals(stmt.value, locals_map)
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
-                    merged = self._merge_types(locals_map.get(target.id), inferred)
+                    current = locals_map.get(target.id)
+                    if (
+                        isinstance(current, ArrayTypeRef)
+                        and isinstance(inferred, ArrayTypeRef)
+                        and current.rank != inferred.rank
+                    ):
+                        merged = inferred
+                    else:
+                        merged = self._merge_types(current, inferred)
                     locals_map[target.id] = merged
                     self._current_symbols[target.id] = merged
                 elif isinstance(target, ast.Tuple):
                     if isinstance(stmt.value, ast.Attribute) and stmt.value.attr == "shape":
                         record_type = None
+                    elif self._is_eig_call(stmt.value):
+                        record_type = self._ensure_record(
+                            "ac_eig_result",
+                            [("item1", ArrayTypeRef(ScalarType.REAL64)), ("item2", ArrayTypeRef(ScalarType.REAL64, rank=2))],
+                        )
+                    elif self._is_svd_call(stmt.value):
+                        record_type = self._ensure_record(
+                            "ac_svd_result",
+                            [("item1", ArrayTypeRef(ScalarType.REAL64, rank=2)), ("item2", ArrayTypeRef(ScalarType.REAL64)), ("item3", ArrayTypeRef(ScalarType.REAL64, rank=2))],
+                        )
                     elif self._is_slogdet_call(stmt.value):
                         record_type = None
                     else:
@@ -686,6 +893,21 @@ class PythonNumpyFrontend:
                             merged = self._merge_types(locals_map.get(elt.id), elt_type)
                             locals_map[elt.id] = merged
                             self._current_symbols[elt.id] = merged
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            annotated = self._map_annotation(stmt.annotation, self._current_function or "module")
+            inferred = annotated or self._infer_type(stmt.value)
+            self._collect_expr_locals(stmt.value, locals_map)
+            current = locals_map.get(stmt.target.id)
+            if (
+                isinstance(current, ArrayTypeRef)
+                and isinstance(inferred, ArrayTypeRef)
+                and current.rank != inferred.rank
+            ):
+                merged = inferred
+            else:
+                merged = self._merge_types(current, inferred)
+            locals_map[stmt.target.id] = merged
+            self._current_symbols[stmt.target.id] = merged
         elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
             self._collect_expr_locals(stmt.value, locals_map)
             inferred = self._infer_type(stmt.value)
@@ -786,16 +1008,34 @@ class PythonNumpyFrontend:
                 target_type = self._current_symbols.get(target.id)
                 if isinstance(target_type, ArrayTypeRef) and target_type.rank == 1 and target_type.element_type == ScalarType.REAL64:
                     return Assignment(ValueRef(target.id), Call("ac_zeros", (Constant(0),)))
+            if isinstance(target, ast.Tuple):
+                return self._lower_tuple_assignment(target, stmt.value)
             value = self._lower_expr(stmt.value)
             if isinstance(target, ast.Name):
                 dtype_name = self._infer_dtype_name(stmt.value)
                 if dtype_name is not None:
                     self._current_dtypes[target.id] = dtype_name
+                contiguity = self._infer_contiguity(stmt.value)
+                if contiguity is not None:
+                    self._current_contiguity[target.id] = contiguity
                 return Assignment(ValueRef(target.id), value)
             if isinstance(target, ast.Subscript):
                 slice_assign = self._lower_slice_assignment(target, value)
                 if slice_assign is not None:
                     return slice_assign
+                if self._is_pairwise_item2_access(target):
+                    row_index, col_index = target.slice.elts
+                    return ExprStatement(
+                        Call(
+                            "ac_set_pick2",
+                            (
+                                self._lower_expr(target.value),
+                                self._lower_index_expr(row_index),
+                                self._lower_index_expr(col_index),
+                                value,
+                            ),
+                        )
+                    )
                 if self._is_item2_access(target):
                     row_index, col_index = target.slice.elts
                     return ExprStatement(
@@ -813,9 +1053,22 @@ class PythonNumpyFrontend:
                     func_name = "ac_set_rows" if isinstance(self._infer_type(target.slice), ArrayTypeRef) else "ac_set_row"
                     return ExprStatement(Call(func_name, (self._lower_expr(target.value), self._lower_index_expr(target.slice), value)))
                 return IndexAssignment(self._lower_expr(target.value), self._lower_index_expr(target.slice), value)
-            if isinstance(target, ast.Tuple):
-                return self._lower_tuple_assignment(target, stmt.value)
             raise NotImplementedError(f"unsupported assignment target: {ast.dump(target)}")
+        if isinstance(stmt, ast.AnnAssign):
+            if not isinstance(stmt.target, ast.Name) or stmt.value is None:
+                raise NotImplementedError(f"unsupported annotated assignment: {ast.dump(stmt)}")
+            annotated = self._map_annotation(stmt.annotation, self._current_function or "module")
+            if annotated is not None:
+                merged = self._merge_types(self._current_symbols.get(stmt.target.id), annotated)
+                self._current_symbols[stmt.target.id] = merged
+            value = self._lower_expr(stmt.value)
+            dtype_name = self._infer_dtype_name(stmt.value)
+            if dtype_name is not None:
+                self._current_dtypes[stmt.target.id] = dtype_name
+            contiguity = self._infer_contiguity(stmt.value)
+            if contiguity is not None:
+                self._current_contiguity[stmt.target.id] = contiguity
+            return Assignment(ValueRef(stmt.target.id), value)
         if isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
             op_map = {
                 ast.Add: BinaryOperator.ADD,
@@ -852,6 +1105,13 @@ class PythonNumpyFrontend:
                 BinaryOp(IndexAccess(self._lower_expr(stmt.target.value), self._lower_index_expr(stmt.target.slice)), op_map[type(stmt.op)], value),
             )
         if isinstance(stmt, ast.Return):
+            if isinstance(stmt.value, ast.Tuple):
+                result_type = self._function_result_types.get(self._current_function or "")
+                if isinstance(result_type, RecordTypeRef):
+                    fields = [(f"item{index}", self._lower_expr(value)) for index, value in enumerate(stmt.value.elts, start=1)]
+                    typed_fields = [(f"item{index}", self._infer_type(value)) for index, value in enumerate(stmt.value.elts, start=1)]
+                    self._ensure_record(result_type.name, typed_fields)
+                    return Return(RecordLiteral(result_type.name, tuple(fields)))
             return Return(self._lower_expr(stmt.value) if stmt.value is not None else None)
         if isinstance(stmt, ast.If):
             if self._is_sys_argv_if(stmt):
@@ -980,6 +1240,19 @@ class PythonNumpyFrontend:
                 and self._attr_chain(stmt.value.func) == ["np", "set_printoptions"]
             ):
                 return ExprStatement(self._lower_numpy_set_printoptions(stmt.value))
+            if (
+                isinstance(stmt.value.func, ast.Attribute)
+                and self._attr_chain(stmt.value.func) == ["np", "put"]
+                and len(stmt.value.args) == 3
+            ):
+                return ExprStatement(Call("ac_put", tuple(self._lower_expr(arg) for arg in stmt.value.args)))
+            if (
+                isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "shuffle"
+                and self._attr_chain(stmt.value.func)[:1] != ["np"]
+                and len(stmt.value.args) == 1
+            ):
+                return ExprStatement(Call("ac_shuffle", (self._lower_expr(stmt.value.func.value), self._lower_expr(stmt.value.args[0]))))
             if isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print":
                 return Print(self._lower_print_args(stmt.value.args))
             if (
@@ -1055,6 +1328,45 @@ class PythonNumpyFrontend:
         handler = stmt.handlers[0]
         if (
             isinstance(handler.type, ast.Name)
+            and handler.type.id == "OSError"
+            and len(stmt.body) == 1
+            and isinstance(stmt.body[0], ast.Assign)
+            and len(stmt.body[0].targets) == 1
+            and isinstance(stmt.body[0].targets[0], ast.Name)
+            and isinstance(stmt.body[0].value, ast.Call)
+            and isinstance(stmt.body[0].value.func, ast.Attribute)
+            and self._attr_chain(stmt.body[0].value.func) == ["np", "loadtxt"]
+            and stmt.body[0].value.args
+            and len(handler.body) == 1
+            and isinstance(handler.body[0], ast.Return)
+        ):
+            except_value = handler.body[0].value
+            if isinstance(except_value, ast.Constant) and except_value.value is None:
+                lowered_except = Return(None)
+            elif (
+                isinstance(except_value, ast.Call)
+                and isinstance(except_value.func, ast.Attribute)
+                and self._attr_chain(except_value.func) == ["np", "empty"]
+            ):
+                lowered_except = Return(self._lower_expr(except_value))
+            else:
+                lowered_except = None
+            if lowered_except is None:
+                return None
+            return (
+                If(
+                    test=Call("ac_file_exists", (self._lower_expr(stmt.body[0].value.args[0]),)),
+                    body=(
+                        Assignment(
+                            ValueRef(stmt.body[0].targets[0].id),
+                            self._lower_expr(stmt.body[0].value),
+                        ),
+                    ),
+                    orelse=(lowered_except,),
+                ),
+            )
+        if (
+            isinstance(handler.type, ast.Name)
             and handler.type.id == "Exception"
             and len(handler.body) == 1
             and isinstance(handler.body[0], ast.Return)
@@ -1111,6 +1423,46 @@ class PythonNumpyFrontend:
         )
 
     def _lower_tuple_assignment(self, target: ast.Tuple, value: ast.AST):
+        if self._is_eig_call(value):
+            if len(target.elts) != 2 or not all(isinstance(elt, ast.Name) for elt in target.elts):
+                raise NotImplementedError("eig tuple assignment requires two simple targets")
+            return ExprStatement(
+                Call("ac_eig", (self._lower_expr(value.args[0]), ValueRef(target.elts[0].id), ValueRef(target.elts[1].id)))
+            )
+        if self._is_svd_call(value):
+            if len(target.elts) != 3 or not all(isinstance(elt, ast.Name) for elt in target.elts):
+                raise NotImplementedError("svd tuple assignment requires three simple targets")
+            return ExprStatement(
+                Call(
+                    "ac_svd",
+                    (
+                        self._lower_expr(value.args[0]),
+                        ValueRef(target.elts[0].id),
+                        ValueRef(target.elts[1].id),
+                        ValueRef(target.elts[2].id),
+                    ),
+                )
+            )
+        if self._is_meshgrid_call(value):
+            if len(target.elts) != 2 or not all(isinstance(elt, ast.Name) for elt in target.elts):
+                raise NotImplementedError("meshgrid tuple assignment requires two simple targets")
+            x_expr = self._lower_expr(value.args[0])
+            y_expr = self._lower_expr(value.args[1])
+            statements = [
+                Assignment(ValueRef(target.elts[0].id), Call("spread", (x_expr, Constant(1), Call("size", (y_expr,))))),
+                Assignment(ValueRef(target.elts[1].id), Call("spread", (y_expr, Constant(2), Call("size", (x_expr,))))),
+            ]
+            return If(Constant(True), tuple(statements), ())
+        if self._is_histogram_call(value):
+            if len(target.elts) != 2 or not all(isinstance(elt, ast.Name) for elt in target.elts):
+                raise NotImplementedError("histogram tuple assignment requires two simple targets")
+            bins_expr = self._lower_histogram_bins(value)
+            x_expr = self._lower_expr(value.args[0])
+            statements = [
+                Assignment(ValueRef(target.elts[0].id), Call("ac_histogram_counts", (x_expr, bins_expr))),
+                Assignment(ValueRef(target.elts[1].id), Call("ac_histogram_edges", (bins_expr,))),
+            ]
+            return If(Constant(True), tuple(statements), ())
         if isinstance(value, ast.Attribute) and value.attr == "shape":
             statements: list[object] = []
             for index, elt in enumerate(target.elts, start=1):
@@ -1231,6 +1583,8 @@ class PythonNumpyFrontend:
             return Constant(expr.value)
         if isinstance(expr, ast.Name):
             return ValueRef(self._loop_target_name(expr.id) if expr.id == "_" else expr.id)
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id == "ac_loadtxt_1d":
+            return Call("ac_loadtxt_1d", tuple(self._lower_expr(arg) for arg in expr.args))
         if isinstance(expr, ast.List):
             return Call("ac_array_literal", tuple(self._lower_expr(elt) for elt in expr.elts))
         if isinstance(expr, ast.ListComp):
@@ -1256,16 +1610,39 @@ class PythonNumpyFrontend:
             self._ensure_record(record_type.name, typed_fields)
             return RecordLiteral(record_type.name, tuple(fields))
         if isinstance(expr, ast.Tuple):
-            record_type = self._function_result_types.get(self._current_function or "")
-            if not isinstance(record_type, RecordTypeRef):
+            if expr.elts and all(self._infer_type(value) == ScalarType.INTEGER for value in expr.elts):
+                record_type = self._shape_record_type(expr, minimum_rank=len(expr.elts))
+                fields = [(f"item{index}", self._lower_expr(value)) for index, value in enumerate(expr.elts, start=1)]
+                return RecordLiteral(record_type.name, tuple(fields))
+            tuple_type = self._infer_type(expr)
+            if isinstance(tuple_type, ArrayTypeRef) and tuple_type.rank == 1:
                 return Call("ac_array_literal", tuple(self._lower_expr(value) for value in expr.elts))
-            fields = [(f"item{index}", self._lower_expr(value)) for index, value in enumerate(expr.elts, start=1)]
-            typed_fields = [(f"item{index}", self._infer_type(value)) for index, value in enumerate(expr.elts, start=1)]
-            self._ensure_record(record_type.name, typed_fields)
-            return RecordLiteral(record_type.name, tuple(fields))
+            record_type = self._function_result_types.get(self._current_function or "")
+            if isinstance(record_type, RecordTypeRef):
+                fields = [(f"item{index}", self._lower_expr(value)) for index, value in enumerate(expr.elts, start=1)]
+                typed_fields = [(f"item{index}", self._infer_type(value)) for index, value in enumerate(expr.elts, start=1)]
+                self._ensure_record(record_type.name, typed_fields)
+                return RecordLiteral(record_type.name, tuple(fields))
+            return Call("ac_array_literal", tuple(self._lower_expr(value) for value in expr.elts))
         if isinstance(expr, ast.Subscript):
             if self._is_np_r_concat(expr):
                 return self._lower_np_r_concat(expr)
+            if self._is_boolean_mask_access(expr):
+                return Call("ac_mask", (self._lower_expr(expr.value), self._lower_expr(expr.slice)))
+            if self._is_item3_access(expr):
+                i0, i1, i2 = expr.slice.elts
+                return Call(
+                    "ac_item3",
+                    (
+                        self._lower_expr(expr.value),
+                        self._lower_index_expr(i0),
+                        self._lower_index_expr(i1),
+                        self._lower_index_expr(i2),
+                    ),
+                )
+            if self._is_pairwise_item2_access(expr):
+                row_index, col_index = expr.slice.elts
+                return Call("ac_pick2", (self._lower_expr(expr.value), self._lower_index_expr(row_index), self._lower_index_expr(col_index)))
             if self._is_item2_access(expr):
                 row_index, col_index = expr.slice.elts
                 return Call("ac_item2", (self._lower_expr(expr.value), self._lower_index_expr(row_index), self._lower_index_expr(col_index)))
@@ -1312,6 +1689,9 @@ class PythonNumpyFrontend:
                 ast.Mult: BinaryOperator.MUL,
                 ast.Div: BinaryOperator.DIV,
                 ast.Pow: BinaryOperator.POW,
+                ast.Mod: BinaryOperator.MOD,
+                ast.BitAnd: BinaryOperator.AND,
+                ast.BitOr: BinaryOperator.OR,
             }
             return BinaryOp(self._lower_expr(expr.left), op_map[type(expr.op)], self._lower_expr(expr.right))
         if isinstance(expr, ast.UnaryOp):
@@ -1319,6 +1699,7 @@ class PythonNumpyFrontend:
                 ast.UAdd: UnaryOperator.PLUS,
                 ast.USub: UnaryOperator.MINUS,
                 ast.Not: UnaryOperator.NOT,
+                ast.Invert: UnaryOperator.NOT,
             }
             return UnaryOp(op_map[type(expr.op)], self._lower_expr(expr.operand))
         if isinstance(expr, ast.Compare):
@@ -1403,10 +1784,16 @@ class PythonNumpyFrontend:
                 if expr.func.id == "range":
                     return Call("range", self._lower_call_args(expr))
                 if expr.func.id == "len":
+                    if expr.args and self._infer_type(expr.args[0]) == ScalarType.STRING:
+                        return Call("len", self._lower_call_args(expr))
                     return Call("size", self._lower_call_args(expr))
                 if expr.func.id == "int":
+                    if expr.args and self._infer_type(expr.args[0]) == ScalarType.STRING:
+                        return Call("ac_parse_int", self._lower_call_args(expr))
                     return Call("int", self._lower_call_args(expr))
                 if expr.func.id == "float":
+                    if expr.args and self._infer_type(expr.args[0]) == ScalarType.STRING:
+                        return Call("ac_parse_real", self._lower_call_args(expr))
                     return Call("float", self._lower_call_args(expr))
                 if expr.func.id == "enumerate":
                     return Call("ac_enumerate", self._lower_call_args(expr))
@@ -1421,6 +1808,9 @@ class PythonNumpyFrontend:
                 if expr.func.attr == "strip":
                     base = self._lower_expr(expr.func.value)
                     return Call("trim", (Call("adjustl", (base,)),))
+                if expr.func.attr == "rstrip":
+                    base = self._lower_expr(expr.func.value)
+                    return Call("trim", (base,))
                 if expr.func.attr == "gauss" and chain[:1] != ["np"]:
                     base = self._lower_expr(expr.func.value)
                     return Call("ac_gauss", (base, *self._lower_call_args(expr)))
@@ -1434,6 +1824,14 @@ class PythonNumpyFrontend:
                         scale_expr = self._lower_expr(scale_ast) if scale_ast is not None else Constant(1.0)
                         return Call("ac_normal_vec", (base, loc_expr, scale_expr, self._lower_expr(size_expr)))
                     return Call("ac_gauss", (base, *self._lower_call_args(expr)))
+                if expr.func.attr == "standard_normal" and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    if expr.args:
+                        return Call("ac_normal_vec", (base, Constant(0.0), Constant(1.0), self._lower_expr(expr.args[0])))
+                    size_ast = self._keyword_value(expr, "size")
+                    if size_ast is not None:
+                        return Call("ac_normal_vec", (base, Constant(0.0), Constant(1.0), self._lower_expr(size_ast)))
+                    return Call("ac_gauss", (base, Constant(0.0), Constant(1.0)))
                 if expr.func.attr == "uniform" and chain[:1] != ["np"]:
                     base = self._lower_expr(expr.func.value)
                     size_ast = self._keyword_value(expr, "size")
@@ -1442,14 +1840,70 @@ class PythonNumpyFrontend:
                         high_ast = self._keyword_value(expr, "high")
                         low_expr = self._lower_expr(low_ast) if low_ast is not None else Constant(0.0)
                         high_expr = self._lower_expr(high_ast) if high_ast is not None else Constant(1.0)
+                        if isinstance(size_ast, ast.Tuple) and len(size_ast.elts) == 2:
+                            n_expr = self._lower_expr(size_ast.elts[0])
+                            m_expr = self._lower_expr(size_ast.elts[1])
+                            return Call(
+                                "ac_reshape",
+                                (
+                                    Call(
+                                        "ac_uniform_vec",
+                                        (base, low_expr, high_expr, BinaryOp(n_expr, BinaryOperator.MUL, m_expr)),
+                                    ),
+                                    n_expr,
+                                    m_expr,
+                                ),
+                            )
                         return Call("ac_uniform_vec", (base, low_expr, high_expr, self._lower_expr(size_ast)))
+                if expr.func.attr == "integers" and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    size_ast = self._keyword_value(expr, "size")
+                    if size_ast is None or len(expr.args) < 2:
+                        raise NotImplementedError("rng.integers currently requires low, high, and size")
+                    return Call("ac_random_integers", (base, self._lower_expr(expr.args[0]), self._lower_expr(expr.args[1]), self._lower_expr(size_ast)))
                 if expr.func.attr == "sum" and chain[:1] != ["np"]:
                     return Call("sum", (self._lower_expr(expr.func.value),))
                 if expr.func.attr == "mean" and chain[:1] != ["np"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    keepdims_expr = self._keyword_value(expr, "keepdims")
+                    if axis_expr is not None:
+                        lowered = Call("ac_mean_axis", (self._lower_expr(expr.func.value), self._lower_expr(axis_expr)))
+                        if isinstance(keepdims_expr, ast.Constant) and keepdims_expr.value is True:
+                            return Call("ac_add_axis", (lowered,))
+                        return lowered
                     return Call("ac_mean", (self._lower_expr(expr.func.value),))
+                if expr.func.attr == "min" and chain[:1] != ["np"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_min_axis", (self._lower_expr(expr.func.value), self._lower_expr(axis_expr)))
+                    return Call("minval", (self._lower_expr(expr.func.value),))
+                if expr.func.attr == "max" and chain[:1] != ["np"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_max_axis", (self._lower_expr(expr.func.value), self._lower_expr(axis_expr)))
+                    return Call("maxval", (self._lower_expr(expr.func.value),))
+                if expr.func.attr == "var" and chain[:1] != ["np"]:
+                    ddof_expr = self._keyword_value(expr, "ddof")
+                    if ddof_expr is None:
+                        ddof_expr = Constant(0)
+                    return Call("ac_var", (self._lower_expr(expr.func.value), self._lower_expr(ddof_expr)))
+                if expr.func.attr == "std" and chain[:1] != ["np"]:
+                    ddof_expr = self._keyword_value(expr, "ddof")
+                    if ddof_expr is None:
+                        ddof_expr = Constant(0)
+                    return Call("ac_std", (self._lower_expr(expr.func.value), self._lower_expr(ddof_expr)))
                 if expr.func.attr == "copy" and chain[:1] != ["np"]:
                     return Call("ac_copy", (self._lower_expr(expr.func.value),))
                 if expr.func.attr == "astype" and chain[:1] != ["np"]:
+                    dtype_name = None
+                    if expr.args:
+                        dtype_name = self._numpy_dtype_name(expr.args[0]) if isinstance(expr.args[0], ast.Attribute) else None
+                        if isinstance(expr.args[0], ast.Name):
+                            dtype_name = expr.args[0].id
+                    if dtype_name in {"int32", "int64", "int"}:
+                        return Call("ac_astype_int", (self._lower_expr(expr.func.value),))
+                    if dtype_name in {"float32", "float64", "float"}:
+                        return Call("ac_astype_float", (self._lower_expr(expr.func.value),))
                     return Call("ac_asarray", (self._lower_expr(expr.func.value),))
                 if expr.func.attr in {"ravel", "flatten"} and chain[:1] != ["np"]:
                     base = self._lower_expr(expr.func.value)
@@ -1463,6 +1917,22 @@ class PythonNumpyFrontend:
                     if order_ast is not None:
                         reshape_args.append(self._lower_expr(order_ast))
                     return Call("ac_reshape", (base, *reshape_args))
+                if expr.func.attr == "transpose" and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    if expr.args:
+                        return Call("ac_transpose_perm", (base, *tuple(self._lower_expr(arg) for arg in expr.args)))
+                    return Call("transpose", (base,))
+                if expr.func.attr == "dot" and chain[:1] != ["np"]:
+                    base = self._lower_expr(expr.func.value)
+                    left_type = self._infer_type(expr.func.value)
+                    right_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    if isinstance(left_type, ArrayTypeRef) and isinstance(right_type, ArrayTypeRef):
+                        if left_type.rank == 1 and right_type.rank == 1:
+                            return Call("ac_dot", (base, self._lower_expr(expr.args[0])))
+                        return Call("ac_matmul", (base, self._lower_expr(expr.args[0])))
+                    return Call("ac_dot", (base, self._lower_expr(expr.args[0])))
+                if expr.func.attr == "trace" and chain[:1] != ["np"]:
+                    return Call("ac_trace", (self._lower_expr(expr.func.value),))
                 if expr.func.attr == "choice" and chain[:1] != ["np"]:
                     base = self._lower_expr(expr.func.value)
                     size_expr = self._keyword_value(expr, "size")
@@ -1489,7 +1959,16 @@ class PythonNumpyFrontend:
                                 self._lower_expr(size_expr),
                             ),
                         )
-                    raise NotImplementedError("only weighted choice and choice without replacement are supported")
+                    if replace_expr is not None and isinstance(replace_expr, ast.Constant) and replace_expr.value is True and expr.args:
+                        return Call(
+                            "ac_choice_replace",
+                            (
+                                base,
+                                self._lower_expr(expr.args[0]),
+                                self._lower_expr(size_expr),
+                            ),
+                        )
+                    raise NotImplementedError("only weighted choice and explicit replace/no-replace choice are supported")
                 if chain == ["np", "random", "default_rng"]:
                     return Call("ac_random_init", self._lower_call_args(expr))
                 if chain == ["np", "random", "multivariate_normal"]:
@@ -1502,6 +1981,13 @@ class PythonNumpyFrontend:
                     rowvar_expr = self._keyword_value(expr, "rowvar")
                     if isinstance(rowvar_expr, ast.Constant) and rowvar_expr.value is False:
                         return Call("ac_cov_rowvar_false", tuple(self._lower_expr(arg) for arg in expr.args))
+                    if (
+                        rowvar_expr is None
+                        and len(expr.args) == 1
+                        and isinstance(expr.args[0], ast.Attribute)
+                        and expr.args[0].attr == "T"
+                    ):
+                        return Call("ac_cov_rowvar_false", (self._lower_expr(expr.args[0].value),))
                     raise NotImplementedError("only np.cov(..., rowvar=False) is currently supported")
                 if chain == ["np", "linalg", "slogdet"]:
                     return Call("ac_slogdet", tuple(self._lower_expr(arg) for arg in expr.args))
@@ -1514,31 +2000,111 @@ class PythonNumpyFrontend:
                         and expr.args[0].value == "ni,ij,nj->n"
                     ):
                         return Call("ac_einsum_ni_ij_nj_to_n", tuple(self._lower_expr(arg) for arg in expr.args[1:]))
+                    if (
+                        expr.args
+                        and isinstance(expr.args[0], ast.Constant)
+                        and expr.args[0].value == "ii->"
+                    ):
+                        return Call("ac_trace", (self._lower_expr(expr.args[1]),))
                     raise NotImplementedError("only np.einsum('ni,ij,nj->n', ...) is currently supported")
                 if chain == ["np", "max"]:
                     axis_expr = self._keyword_value(expr, "axis")
                     if axis_expr is not None:
                         return Call("ac_max_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
-                    return Call("max", tuple(self._lower_expr(arg) for arg in expr.args))
+                    return Call("maxval", (self._lower_expr(expr.args[0]),))
+                if chain == ["np", "min"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_min_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
+                    return Call("minval", (self._lower_expr(expr.args[0]),))
                 if chain == ["np", "sum"]:
                     axis_expr = self._keyword_value(expr, "axis")
                     if axis_expr is not None:
                         return Call("ac_sum_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
                     return Call("sum", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "mean"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    keepdims_expr = self._keyword_value(expr, "keepdims")
+                    if axis_expr is not None:
+                        lowered = Call("ac_mean_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
+                        if isinstance(keepdims_expr, ast.Constant) and keepdims_expr.value is True:
+                            return Call("ac_add_axis", (lowered,))
+                        return lowered
+                    return Call("ac_mean", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "var"]:
+                    ddof_expr = self._keyword_value(expr, "ddof")
+                    if ddof_expr is None:
+                        ddof_expr = ast.Constant(value=0)
+                    return Call("ac_var", (self._lower_expr(expr.args[0]), self._lower_expr(ddof_expr)))
+                if chain == ["np", "std"]:
+                    ddof_expr = self._keyword_value(expr, "ddof")
+                    if ddof_expr is None:
+                        ddof_expr = ast.Constant(value=0)
+                    return Call("ac_std", (self._lower_expr(expr.args[0]), self._lower_expr(ddof_expr)))
+                if chain == ["np", "argmin"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_argmin_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
+                    return Call("ac_argmin", (self._lower_expr(expr.args[0]),))
+                if chain == ["np", "argmax"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_argmax_axis", (self._lower_expr(expr.args[0]), self._lower_expr(axis_expr)))
+                    return Call("ac_argmax", (self._lower_expr(expr.args[0]),))
+                if chain == ["np", "trace"]:
+                    return Call("ac_trace", (self._lower_expr(expr.args[0]),))
                 if chain == ["np", "argsort"]:
                     return Call("ac_argsort", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "sort"]:
+                    return Call("ac_sort", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "unique"]:
+                    return Call("ac_unique", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "bincount"]:
+                    return Call("ac_bincount", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "searchsorted"]:
+                    side_expr = self._keyword_value(expr, "side")
+                    side_text = "left"
+                    if isinstance(side_expr, ast.Constant) and isinstance(side_expr.value, str):
+                        side_text = side_expr.value
+                    helper = "ac_searchsorted_left" if side_text == "left" else "ac_searchsorted_right"
+                    return Call(helper, tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "outer"]:
+                    return Call("ac_outer", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "kron"]:
+                    return Call("ac_kron", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "meshgrid"]:
+                    raise NotImplementedError("np.meshgrid is only supported in tuple assignment")
                 if chain == ["np", "ndim"]:
                     return Call("ac_ndim", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "eye"]:
                     return Call("ac_eye", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "diag"]:
+                    args = tuple(self._lower_expr(arg) for arg in expr.args)
+                    if len(expr.args) == 1:
+                        return Call("ac_diag", args)
+                    return Call("ac_diag_k", args)
                 if chain == ["np", "atleast_2d"]:
                     return Call("ac_atleast_2d", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "log"]:
                     return Call("log", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "exp"]:
                     return Call("exp", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "sqrt"]:
+                    return Call("sqrt", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "sign"]:
+                    return Call("ac_sign", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "floor"]:
+                    return Call("ac_floor", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "ceil"]:
+                    return Call("ac_ceil", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "abs"]:
                     return Call("abs", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "isnan"]:
+                    return Call("ac_isnan", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "isfinite"]:
+                    return Call("ac_isfinite", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "nansum"]:
+                    return Call("ac_nansum", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "all"]:
                     return Call("all", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "dot"]:
@@ -1580,6 +2146,11 @@ class PythonNumpyFrontend:
                         return Call("ac_full", (*tuple(self._lower_expr(elt) for elt in expr.args[0].elts), self._lower_expr(expr.args[1])))
                     return Call("ac_full", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "arange"]:
+                    if expr.args and all(self._infer_type(arg) == ScalarType.INTEGER for arg in expr.args):
+                        if len(expr.args) == 1:
+                            return Call("ac_arange_int", (Constant(0), self._lower_expr(expr.args[0])))
+                        if len(expr.args) == 2:
+                            return Call("ac_arange_int", tuple(self._lower_expr(arg) for arg in expr.args))
                     if len(expr.args) == 1:
                         return Call("ac_arange", (Constant(0), self._lower_expr(expr.args[0])))
                     return Call("ac_arange", tuple(self._lower_expr(arg) for arg in expr.args))
@@ -1589,10 +2160,87 @@ class PythonNumpyFrontend:
                     if expr.args and isinstance(expr.args[0], ast.Tuple):
                         return Call("ac_column_stack", tuple(self._lower_expr(elt) for elt in expr.args[0].elts))
                     return Call("ac_column_stack", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "concatenate"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    axis_value = self._const_int_value(axis_expr) if axis_expr is not None else 0
+                    arrays = expr.args[0].elts if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) else expr.args
+                    helper = "ac_concatenate_axis0" if axis_value == 0 else "ac_concatenate_axis1"
+                    return Call(helper, tuple(self._lower_expr(arg) for arg in arrays))
+                if chain == ["np", "hstack"]:
+                    arrays = expr.args[0].elts if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) else expr.args
+                    return Call("ac_hstack", tuple(self._lower_expr(arg) for arg in arrays))
+                if chain == ["np", "vstack"]:
+                    arrays = expr.args[0].elts if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) else expr.args
+                    return Call("ac_vstack", tuple(self._lower_expr(arg) for arg in arrays))
+                if chain == ["np", "stack"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    axis_value = self._const_int_value(axis_expr) if axis_expr is not None else 0
+                    arrays = expr.args[0].elts if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) else expr.args
+                    helper = "ac_stack_axis0" if axis_value == 0 else "ac_stack_axis2"
+                    return Call(helper, tuple(self._lower_expr(arg) for arg in arrays))
                 if chain == ["np", "round"]:
                     return Call("ac_round", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "clip"]:
                     return Call("ac_clip", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "repeat"]:
+                    axis_expr = self._keyword_value(expr, "axis")
+                    if axis_expr is not None:
+                        return Call("ac_repeat_axis", (self._lower_expr(expr.args[0]), self._lower_expr(expr.args[1]), self._lower_expr(axis_expr)))
+                    return Call("ac_repeat", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "tile"]:
+                    return Call("ac_tile", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "take"]:
+                    return Call("ac_take", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "broadcast_to"]:
+                    if len(expr.args) != 2 or not isinstance(expr.args[1], ast.Tuple) or len(expr.args[1].elts) != 2:
+                        raise NotImplementedError("np.broadcast_to currently requires a 2D target shape")
+                    return Call("spread", (self._lower_expr(expr.args[0]), Constant(1), self._lower_expr(expr.args[1].elts[0])))
+                if chain == ["np", "histogram"]:
+                    raise NotImplementedError("np.histogram is only supported in tuple assignment")
+                if chain == ["np", "pad"]:
+                    if len(expr.args) < 2 or not isinstance(expr.args[1], ast.Tuple) or len(expr.args[1].elts) != 2:
+                        raise NotImplementedError("np.pad currently requires a 2-tuple pad width")
+                    const_expr = self._keyword_value(expr, "constant_values")
+                    constant_value = self._lower_expr(const_expr) if const_expr is not None else Constant(0)
+                    return Call(
+                        "ac_pad",
+                        (
+                            self._lower_expr(expr.args[0]),
+                            self._lower_expr(expr.args[1].elts[0]),
+                            self._lower_expr(expr.args[1].elts[1]),
+                            constant_value,
+                        ),
+                    )
+                if chain == ["np", "roll"]:
+                    return Call("ac_roll", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "flip"]:
+                    return Call("ac_reverse", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "triu"]:
+                    return Call("ac_triu", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "tril"]:
+                    return Call("ac_tril", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "cumsum"]:
+                    return Call("ac_cumsum", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "cumprod"]:
+                    return Call("ac_cumprod", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "diff"]:
+                    return Call("ac_diff", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "gradient"]:
+                    return Call("ac_gradient", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "swapaxes"]:
+                    return Call("ac_swapaxes", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "add", "reduceat"]:
+                    return Call("ac_reduceat_add", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "ascontiguousarray"] or chain == ["np", "asfortranarray"]:
+                    return Call("ac_copy", (self._lower_expr(expr.args[0]),))
+                if chain == ["np", "linalg", "det"]:
+                    return Call("ac_det", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "linalg", "cholesky"]:
+                    return Call("ac_cholesky", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "linalg", "eig"]:
+                    raise NotImplementedError("np.linalg.eig is only supported in tuple assignment")
+                if chain == ["np", "linalg", "svd"]:
+                    raise NotImplementedError("np.linalg.svd is only supported in tuple assignment")
                 if chain == ["np", "linalg", "solve"]:
                     return Call("ac_solve_linear", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "linalg", "norm"]:
@@ -1606,8 +2254,13 @@ class PythonNumpyFrontend:
             dtype_name = self._numpy_dtype_name(expr)
             if dtype_name is not None:
                 return Constant(dtype_name)
+            flag_value = self._infer_contiguity_flag(expr)
+            if flag_value is not None:
+                return Constant(flag_value)
             if self._attr_chain(expr) == ["np", "inf"]:
                 return Constant(float("inf"))
+            if self._attr_chain(expr) == ["np", "nan"]:
+                return Call("ac_nan", ())
             if self._attr_chain(expr) == ["np", "pi"]:
                 return Constant(3.141592653589793)
             if self._attr_chain(expr) == ["sys", "argv"]:
@@ -1618,7 +2271,7 @@ class PythonNumpyFrontend:
                     return Constant(dtype_name)
             base = self._lower_expr(expr.value)
             if expr.attr == "T":
-                return Call("ac_transpose", (base,))
+                return Call("transpose", (base,))
             if expr.attr == "size":
                 return Call("size", (base,))
             if expr.attr == "ndim":
@@ -1666,6 +2319,9 @@ class PythonNumpyFrontend:
                 ast.Mult: BinaryOperator.MUL,
                 ast.Div: BinaryOperator.DIV,
                 ast.Pow: BinaryOperator.POW,
+                ast.Mod: BinaryOperator.MOD,
+                ast.BitAnd: BinaryOperator.AND,
+                ast.BitOr: BinaryOperator.OR,
             }
             return BinaryOp(self._lower_index_expr(expr.left), op_map[type(expr.op)], self._lower_index_expr(expr.right))
         if isinstance(expr, ast.UnaryOp):
@@ -1673,6 +2329,7 @@ class PythonNumpyFrontend:
                 ast.USub: UnaryOperator.MINUS,
                 ast.UAdd: UnaryOperator.PLUS,
                 ast.Not: UnaryOperator.NOT,
+                ast.Invert: UnaryOperator.NOT,
             }
             return UnaryOp(op_map[type(expr.op)], self._lower_index_expr(expr.operand))
         return self._lower_expr(expr)
@@ -1687,7 +2344,29 @@ class PythonNumpyFrontend:
                 return ScalarType.REAL64
             if isinstance(expr.value, str):
                 return ScalarType.STRING
-        if isinstance(expr, (ast.Compare, ast.BoolOp)):
+        if isinstance(expr, ast.Compare):
+            left_type = self._infer_type(expr.left)
+            comparator_types = [self._infer_type(comp) for comp in expr.comparators]
+            array_types = [typ for typ in [left_type, *comparator_types] if isinstance(typ, ArrayTypeRef)]
+            if array_types:
+                return ArrayTypeRef(ScalarType.LOGICAL, rank=max(typ.rank for typ in array_types))
+            return ScalarType.LOGICAL
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.MatMult):
+            left_type = self._infer_type(expr.left)
+            right_type = self._infer_type(expr.right)
+            if isinstance(left_type, ArrayTypeRef) and isinstance(right_type, ArrayTypeRef):
+                if left_type.rank == 1 and right_type.rank == 1:
+                    return ScalarType.REAL64
+                if (left_type.rank == 1 and right_type.rank == 2) or (left_type.rank == 2 and right_type.rank == 1):
+                    return ArrayTypeRef(ScalarType.REAL64, rank=1)
+                if left_type.rank == 2 and right_type.rank == 2:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            return ScalarType.REAL64
+        if isinstance(expr, ast.BoolOp):
+            value_types = [self._infer_type(value) for value in expr.values]
+            array_types = [typ for typ in value_types if isinstance(typ, ArrayTypeRef)]
+            if array_types:
+                return ArrayTypeRef(ScalarType.LOGICAL, rank=max(typ.rank for typ in array_types))
             return ScalarType.LOGICAL
         if isinstance(expr, ast.List):
             return ArrayTypeRef(ScalarType.REAL64)
@@ -1696,11 +2375,26 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Subscript):
             if self._is_np_r_concat(expr):
                 return ArrayTypeRef(ScalarType.REAL64)
+            if self._is_pairwise_item2_access(expr):
+                container_type = self._infer_type(expr.value)
+                if isinstance(container_type, ArrayTypeRef):
+                    return ArrayTypeRef(container_type.element_type, rank=1)
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
             if self._is_item2_access(expr):
                 container_type = self._infer_type(expr.value)
                 if isinstance(container_type, ArrayTypeRef):
                     return container_type.element_type
                 return ScalarType.REAL64
+            if self._is_item3_access(expr):
+                container_type = self._infer_type(expr.value)
+                if isinstance(container_type, ArrayTypeRef):
+                    return container_type.element_type
+                return ScalarType.REAL64
+            if self._is_boolean_mask_access(expr):
+                container_type = self._infer_type(expr.value)
+                if isinstance(container_type, ArrayTypeRef):
+                    return ArrayTypeRef(container_type.element_type, rank=1)
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
             if self._is_where_first_index(expr):
                 return ArrayTypeRef(ScalarType.INTEGER)
             if self._is_shape_dim_access(expr):
@@ -1715,8 +2409,17 @@ class PythonNumpyFrontend:
                 tuple_index = self._const_int_value(expr.slice)
                 if tuple_index is not None:
                     return self._tuple_item_type(container_type, tuple_index + 1)
+                if isinstance(expr.slice, ast.Constant) and isinstance(expr.slice.value, str):
+                    record = self._record_defs.get(container_type.name)
+                    if record is not None:
+                        for field_name, field_type in record.fields:
+                            if field_name == expr.slice.value:
+                                return field_type
             if isinstance(container_type, ArrayTypeRef):
                 if self._is_row_gather(expr):
+                    return ArrayTypeRef(container_type.element_type, rank=container_type.rank)
+                index_type = self._infer_type(expr.slice)
+                if isinstance(index_type, ArrayTypeRef):
                     return ArrayTypeRef(container_type.element_type, rank=container_type.rank)
                 if container_type.rank > 1 and not isinstance(expr.slice, ast.Tuple):
                     return ArrayTypeRef(container_type.element_type, rank=container_type.rank - 1)
@@ -1725,6 +2428,13 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.Dict):
             return self._function_result_types.get(self._current_function or "", ScalarType.REAL64)
         if isinstance(expr, ast.Tuple):
+            if expr.elts and all(self._infer_type(value) == ScalarType.INTEGER for value in expr.elts):
+                return self._shape_record_type(expr, minimum_rank=len(expr.elts))
+            elt_types = [self._infer_type(value) for value in expr.elts]
+            if elt_types and all(isinstance(elt_type, ScalarType) for elt_type in elt_types) and all(
+                elt_type == elt_types[0] for elt_type in elt_types
+            ):
+                return ArrayTypeRef(elt_types[0], rank=1)
             return self._function_result_types.get(self._current_function or "", ScalarType.REAL64)
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Name) and expr.func.id == "len":
@@ -1746,47 +2456,237 @@ class PythonNumpyFrontend:
                 return self._shape_record_type(expr.args[0] if expr.args else None)
             if isinstance(expr.func, ast.Name) and expr.func.id == "ac_shape_dim":
                 return ScalarType.INTEGER
-            if isinstance(expr.func, ast.Name) and expr.func.id in {"min", "max"} and expr.args:
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"min", "max", "minval", "maxval"} and expr.args:
                 arg_types = [self._infer_type(arg) for arg in expr.args]
                 if all(arg_type == ScalarType.INTEGER for arg_type in arg_types):
                     return ScalarType.INTEGER
                 if any(isinstance(arg_type, ArrayTypeRef) for arg_type in arg_types):
                     return ArrayTypeRef(ScalarType.REAL64)
                 return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_argmin", "ac_argmax"}:
+                return ScalarType.INTEGER
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_var", "ac_std"}:
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_trace":
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_outer":
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_kron":
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_sum_axis", "ac_mean_axis", "ac_min_axis", "ac_max_axis"}:
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_concatenate_axis0", "ac_concatenate_axis1", "ac_hstack", "ac_vstack"}:
+                first_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, rank=2)
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_stack_axis0", "ac_stack_axis2"}:
+                first_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64, rank=2)
+                element_type = first_type.element_type if isinstance(first_type, ArrayTypeRef) else ScalarType.REAL64
+                return ArrayTypeRef(element_type, rank=3)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_cumsum", "ac_cumprod", "ac_diff", "ac_gradient"}:
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_take", "ac_pad", "ac_roll"}:
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                return arg_type if isinstance(arg_type, ArrayTypeRef) else ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_floor", "ac_ceil"}:
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                return arg_type
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_isnan":
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                if isinstance(arg_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.LOGICAL, rank=arg_type.rank)
+                return ScalarType.LOGICAL
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_isfinite":
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                if isinstance(arg_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.LOGICAL, rank=arg_type.rank)
+                return ScalarType.LOGICAL
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_nansum":
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_random_integers":
+                return ArrayTypeRef(ScalarType.INTEGER)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_choice_replace":
+                return ArrayTypeRef(ScalarType.INTEGER)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_diag":
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                if isinstance(arg_type, ArrayTypeRef) and arg_type.rank == 1:
+                    return ArrayTypeRef(arg_type.element_type, rank=2)
+                if isinstance(arg_type, ArrayTypeRef) and arg_type.rank == 2:
+                    return ArrayTypeRef(arg_type.element_type, rank=1)
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_reduceat_add":
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_histogram_counts":
+                return ArrayTypeRef(ScalarType.INTEGER)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_histogram_edges":
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_det":
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_loadtxt_1d":
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_loadtxt":
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_reshape":
+                if len(expr.args) == 2:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                if len(expr.args) == 3 and all(self._infer_type(arg) == ScalarType.INTEGER for arg in expr.args[1:]):
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if len(expr.args) == 4 and all(self._infer_type(arg) == ScalarType.INTEGER for arg in expr.args[1:4]):
+                    return ArrayTypeRef(ScalarType.REAL64, rank=3)
+                base_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                if isinstance(base_type, ArrayTypeRef):
+                    return base_type
+                return ArrayTypeRef(ScalarType.REAL64)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "spread" and expr.args:
+                arg_type = self._infer_type(expr.args[0]) if isinstance(expr.args[0], ast.AST) else ScalarType.REAL64
+                if isinstance(arg_type, ArrayTypeRef):
+                    return ArrayTypeRef(arg_type.element_type, rank=arg_type.rank + 1)
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if isinstance(expr.func, ast.Name) and expr.func.id == "transpose" and expr.args:
+                arg_type = self._infer_type(expr.args[0])
+                if isinstance(arg_type, ArrayTypeRef):
+                    return ArrayTypeRef(arg_type.element_type, rank=arg_type.rank)
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
             chain = self._attr_chain(expr.func) if isinstance(expr.func, ast.Attribute) else []
+            if chain in (["np", "array"], ["np", "asarray"]):
+                element_type = self._infer_numpy_array_element_type(expr)
+                if expr.args:
+                    return ArrayTypeRef(element_type, rank=self._infer_array_rank(expr.args[0]))
+                return ArrayTypeRef(element_type)
+            if chain == ["np", "linalg", "solve"]:
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
+            if chain == ["np", "linalg", "norm"]:
+                return ScalarType.REAL64
+            if chain == ["np", "linalg", "det"]:
+                return ScalarType.REAL64
+            if chain == ["np", "linalg", "cholesky"]:
+                return ArrayTypeRef(ScalarType.REAL64, rank=2)
+            if chain in (["np", "zeros"], ["np", "ones"], ["np", "empty"], ["np", "full"]):
+                element_type = self._infer_numpy_array_element_type(expr)
+                if expr.args:
+                    return ArrayTypeRef(element_type, rank=self._infer_shape_arg_rank(expr.args[0]))
+                return ArrayTypeRef(element_type)
+            if chain == ["np", "arange"]:
+                if expr.args and all(self._infer_type(arg) == ScalarType.INTEGER for arg in expr.args):
+                    return ArrayTypeRef(ScalarType.INTEGER)
+                return ArrayTypeRef(ScalarType.REAL64)
+            if chain == ["np", "linspace"]:
+                return ArrayTypeRef(ScalarType.REAL64)
+            if chain == ["np", "clip"]:
+                arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                return arg_type
             if isinstance(expr.func, ast.Attribute) and self._is_strip_lower_chain(expr.func):
                 return ScalarType.STRING
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "strip":
+                return ScalarType.STRING
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "rstrip":
                 return ScalarType.STRING
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "gauss" and chain[:1] != ["np"]:
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "normal" and chain[:1] != ["np"]:
                 size_expr = self._keyword_value(expr, "size")
                 if size_expr is not None:
+                    if isinstance(size_expr, ast.Tuple) and len(size_expr.elts) == 2:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "standard_normal" and chain[:1] != ["np"]:
+                size_expr = self._keyword_value(expr, "size")
+                if size_expr is None and expr.args:
+                    size_expr = expr.args[0]
+                if size_expr is not None:
+                    if isinstance(size_expr, ast.Tuple) and len(size_expr.elts) == 2:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=2)
                     return ArrayTypeRef(ScalarType.REAL64)
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "uniform" and chain[:1] != ["np"]:
                 size_expr = self._keyword_value(expr, "size")
                 if size_expr is not None:
+                    if isinstance(size_expr, ast.Tuple) and len(size_expr.elts) == 2:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=2)
                     return ArrayTypeRef(ScalarType.REAL64)
                 return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "integers" and chain[:1] != ["np"]:
+                size_expr = self._keyword_value(expr, "size")
+                if size_expr is not None:
+                    if isinstance(size_expr, ast.Tuple) and len(size_expr.elts) == 2:
+                        return ArrayTypeRef(ScalarType.INTEGER, rank=2)
+                    return ArrayTypeRef(ScalarType.INTEGER)
+                return ScalarType.INTEGER
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "sum" and chain[:1] != ["np"]:
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "mean" and chain[:1] != ["np"]:
+                axis_expr = self._keyword_value(expr, "axis")
+                keepdims_expr = self._keyword_value(expr, "keepdims")
+                if axis_expr is not None:
+                    if isinstance(keepdims_expr, ast.Constant) and keepdims_expr.value is True:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr in {"min", "max"} and chain[:1] != ["np"]:
+                axis_expr = self._keyword_value(expr, "axis")
+                if axis_expr is not None:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr in {"var", "std"} and chain[:1] != ["np"]:
                 return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "copy" and chain[:1] != ["np"]:
                 return self._infer_type(expr.func.value)
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "astype" and chain[:1] != ["np"]:
+                if expr.args:
+                    dtype_name = self._numpy_dtype_name(expr.args[0]) if isinstance(expr.args[0], ast.Attribute) else None
+                    if isinstance(expr.args[0], ast.Name) and expr.args[0].id == "int":
+                        dtype_name = "int"
+                    if isinstance(expr.args[0], ast.Name) and expr.args[0].id == "float":
+                        dtype_name = "float"
+                    if dtype_name in {"int32", "int64", "int"}:
+                        value_type = self._infer_type(expr.func.value)
+                        if isinstance(value_type, ArrayTypeRef):
+                            return ArrayTypeRef(ScalarType.INTEGER, rank=value_type.rank)
+                        return ScalarType.INTEGER
+                    if dtype_name in {"float32", "float64", "float"}:
+                        value_type = self._infer_type(expr.func.value)
+                        if isinstance(value_type, ArrayTypeRef):
+                            return ArrayTypeRef(ScalarType.REAL64, rank=value_type.rank)
+                        return ScalarType.REAL64
                 return self._infer_type(expr.func.value)
             if isinstance(expr.func, ast.Attribute) and expr.func.attr in {"ravel", "flatten"} and chain[:1] != ["np"]:
+                value_type = self._infer_type(expr.func.value)
+                if isinstance(value_type, ArrayTypeRef):
+                    return ArrayTypeRef(value_type.element_type, rank=1)
                 return ArrayTypeRef(ScalarType.REAL64)
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "reshape" and chain[:1] != ["np"]:
-                return ArrayTypeRef(ScalarType.REAL64, rank=self._reshape_rank(expr))
+                value_type = self._infer_type(expr.func.value)
+                element_type = value_type.element_type if isinstance(value_type, ArrayTypeRef) else ScalarType.REAL64
+                return ArrayTypeRef(element_type, rank=self._reshape_rank(expr))
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "transpose" and chain[:1] != ["np"]:
+                base_type = self._infer_type(expr.func.value)
+                if isinstance(base_type, ArrayTypeRef):
+                    return base_type
+                return ArrayTypeRef(ScalarType.REAL64, rank=max(2, len(expr.args)))
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "dot" and chain[:1] != ["np"]:
+                base_type = self._infer_type(expr.func.value)
+                other_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                if isinstance(base_type, ArrayTypeRef) and isinstance(other_type, ArrayTypeRef):
+                    if base_type.rank == 1 and other_type.rank == 1:
+                        return ScalarType.REAL64
+                    if base_type.rank == 2 and other_type.rank == 2:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    if base_type.rank == 2 and other_type.rank == 1:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=1)
+                    if base_type.rank == 1 and other_type.rank == 2:
+                        return ArrayTypeRef(ScalarType.REAL64, rank=1)
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "trace" and chain[:1] != ["np"]:
+                return ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "choice" and chain[:1] != ["np"]:
                 size_expr = self._keyword_value(expr, "size")
                 if size_expr is not None:
                     return ArrayTypeRef(ScalarType.INTEGER)
                 return ScalarType.INTEGER
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr == "shuffle" and chain[:1] != ["np"]:
+                return ScalarType.NONE
             if isinstance(expr.func, ast.Attribute):
                 if chain == ["np", "random", "default_rng"]:
                     return RecordTypeRef("ac_random_state")
@@ -1796,13 +2696,50 @@ class PythonNumpyFrontend:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
                 if chain == ["np", "cov"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "meshgrid"]:
+                    return self._ensure_record(
+                        "ac_meshgrid_result",
+                        [("item1", ArrayTypeRef(ScalarType.REAL64, rank=2)), ("item2", ArrayTypeRef(ScalarType.REAL64, rank=2))],
+                    )
+                if chain == ["np", "histogram"]:
+                    return self._ensure_record(
+                        "ac_histogram_result",
+                        [("item1", ArrayTypeRef(ScalarType.INTEGER)), ("item2", ArrayTypeRef(ScalarType.REAL64))],
+                    )
+                if chain == ["np", "broadcast_to"]:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "add", "reduceat"]:
+                    return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "ascontiguousarray"] or chain == ["np", "asfortranarray"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    return arg_type
+                if chain == ["np", "linalg", "det"]:
+                    return ScalarType.REAL64
+                if chain == ["np", "linalg", "eig"]:
+                    return self._ensure_record(
+                        "ac_eig_result",
+                        [("item1", ArrayTypeRef(ScalarType.REAL64)), ("item2", ArrayTypeRef(ScalarType.REAL64, rank=2))],
+                    )
+                if chain == ["np", "linalg", "svd"]:
+                    return self._ensure_record(
+                        "ac_svd_result",
+                        [("item1", ArrayTypeRef(ScalarType.REAL64, rank=2)), ("item2", ArrayTypeRef(ScalarType.REAL64)), ("item3", ArrayTypeRef(ScalarType.REAL64, rank=2))],
+                    )
                 if chain == ["np", "linalg", "slogdet"]:
                     return self._ensure_record("ac_slogdet_result", [("item1", ScalarType.REAL64), ("item2", ScalarType.REAL64)])
                 if chain == ["np", "linalg", "inv"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "linalg", "cholesky"]:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
                 if chain == ["np", "einsum"]:
+                    if expr.args and isinstance(expr.args[0], ast.Constant) and expr.args[0].value == "ii->":
+                        return ScalarType.REAL64
                     return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "max"]:
+                    if self._keyword_value(expr, "axis") is not None:
+                        return ArrayTypeRef(ScalarType.REAL64)
+                    return ScalarType.REAL64
+                if chain == ["np", "min"]:
                     if self._keyword_value(expr, "axis") is not None:
                         return ArrayTypeRef(ScalarType.REAL64)
                     return ScalarType.REAL64
@@ -1810,17 +2747,57 @@ class PythonNumpyFrontend:
                     if self._keyword_value(expr, "axis") is not None:
                         return ArrayTypeRef(ScalarType.REAL64)
                     return ScalarType.REAL64
+                if chain == ["np", "mean"]:
+                    keepdims_expr = self._keyword_value(expr, "keepdims")
+                    if self._keyword_value(expr, "axis") is not None:
+                        if isinstance(keepdims_expr, ast.Constant) and keepdims_expr.value is True:
+                            return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                        return ArrayTypeRef(ScalarType.REAL64)
+                    return ScalarType.REAL64
+                if chain == ["np", "argmin"] or chain == ["np", "argmax"]:
+                    if self._keyword_value(expr, "axis") is not None:
+                        return ArrayTypeRef(ScalarType.INTEGER)
+                    return ScalarType.INTEGER
+                if chain == ["np", "cumsum"] or chain == ["np", "cumprod"] or chain == ["np", "diff"] or chain == ["np", "gradient"]:
+                    return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "argsort"]:
+                    return ArrayTypeRef(ScalarType.INTEGER)
+                if chain == ["np", "sort"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    return arg_type
+                if chain == ["np", "unique"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return ArrayTypeRef(arg_type.element_type)
+                    return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "bincount"]:
+                    return ArrayTypeRef(ScalarType.INTEGER)
+                if chain == ["np", "searchsorted"]:
                     return ArrayTypeRef(ScalarType.INTEGER)
                 if chain == ["np", "ndim"]:
                     return ScalarType.INTEGER
                 if chain == ["np", "eye"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "diag"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    if isinstance(arg_type, ArrayTypeRef) and arg_type.rank == 1:
+                        return ArrayTypeRef(arg_type.element_type, rank=2)
+                    if isinstance(arg_type, ArrayTypeRef) and arg_type.rank == 2:
+                        return ArrayTypeRef(arg_type.element_type, rank=1)
+                    return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "atleast_2d"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
-                if chain == ["np", "log"] or chain == ["np", "exp"]:
+                if chain == ["np", "log"] or chain == ["np", "exp"] or chain == ["np", "sqrt"]:
                     arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
                     return arg_type
+                if chain == ["np", "floor"] or chain == ["np", "ceil"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    return arg_type
+                if chain == ["np", "sign"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return ArrayTypeRef(ScalarType.REAL64, rank=arg_type.rank)
+                    return ScalarType.REAL64
                 if chain == ["np", "abs"]:
                     arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
                     if isinstance(arg_type, ArrayTypeRef):
@@ -1830,41 +2807,111 @@ class PythonNumpyFrontend:
                     return ScalarType.LOGICAL
                 if chain == ["np", "any"]:
                     return ScalarType.LOGICAL
+                if chain == ["np", "isnan"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return ArrayTypeRef(ScalarType.LOGICAL, rank=arg_type.rank)
+                    return ScalarType.LOGICAL
+                if chain == ["np", "isfinite"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return ArrayTypeRef(ScalarType.LOGICAL, rank=arg_type.rank)
+                    return ScalarType.LOGICAL
+                if chain == ["np", "nansum"]:
+                    return ScalarType.REAL64
+                if chain == ["np", "copy"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    return arg_type
                 if chain == ["np", "clip"]:
                     arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
                     return arg_type
-                if chain == ["np", "dot"]:
-                    return ScalarType.REAL64
-                if chain == ["np", "array"] or chain == ["np", "asarray"]:
-                    if expr.args:
-                        return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_array_rank(expr.args[0]))
+                if chain == ["np", "repeat"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    return arg_type
+                if chain == ["np", "tile"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    return arg_type
+                if chain == ["np", "take"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return ArrayTypeRef(arg_type.element_type, rank=1)
                     return ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "pad"] or chain == ["np", "roll"] or chain == ["np", "flip"]:
+                    return self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64)
+                if chain == ["np", "triu"] or chain == ["np", "tril"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    return arg_type
+                if chain == ["np", "dot"]:
+                    left_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    right_type = self._infer_type(expr.args[1]) if len(expr.args) > 1 else ScalarType.REAL64
+                    if isinstance(left_type, ArrayTypeRef) and isinstance(right_type, ArrayTypeRef):
+                        if left_type.rank == 1 and right_type.rank == 1:
+                            return ScalarType.REAL64
+                        if left_type.rank == 2 and right_type.rank == 2:
+                            return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                        if left_type.rank == 2 and right_type.rank == 1:
+                            return ArrayTypeRef(ScalarType.REAL64, rank=1)
+                        if left_type.rank == 1 and right_type.rank == 2:
+                            return ArrayTypeRef(ScalarType.REAL64, rank=1)
+                    return ScalarType.REAL64
+                if chain == ["np", "trace"]:
+                    return ScalarType.REAL64
+                if chain == ["np", "outer"] or chain == ["np", "kron"]:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "array"] or chain == ["np", "asarray"]:
+                    element_type = self._infer_numpy_array_element_type(expr)
+                    if expr.args:
+                        return ArrayTypeRef(element_type, rank=self._infer_array_rank(expr.args[0]))
+                    return ArrayTypeRef(element_type)
                 if chain == ["np", "roots"]:
                     return ArrayTypeRef(ScalarType.COMPLEX128)
                 if chain == ["np", "zeros"]:
+                    element_type = self._infer_numpy_array_element_type(expr)
                     if expr.args:
-                        return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
-                    return ArrayTypeRef(ScalarType.REAL64)
+                        return ArrayTypeRef(element_type, rank=self._infer_shape_arg_rank(expr.args[0]))
+                    return ArrayTypeRef(element_type)
                 if chain == ["np", "ones"]:
+                    element_type = self._infer_numpy_array_element_type(expr)
                     if expr.args:
-                        return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
-                    return ArrayTypeRef(ScalarType.REAL64)
+                        return ArrayTypeRef(element_type, rank=self._infer_shape_arg_rank(expr.args[0]))
+                    return ArrayTypeRef(element_type)
                 if chain == ["np", "where"]:
                     if len(expr.args) == 3:
-                        return self._infer_type(expr.args[1])
+                        true_type = self._infer_type(expr.args[1])
+                        false_type = self._infer_type(expr.args[2])
+                        if isinstance(true_type, ArrayTypeRef):
+                            return true_type
+                        if isinstance(false_type, ArrayTypeRef):
+                            return false_type
+                        return true_type
                     return ArrayTypeRef(ScalarType.INTEGER)
                 if chain == ["np", "empty"] or chain == ["np", "full"]:
+                    element_type = self._infer_numpy_array_element_type(expr)
                     if expr.args:
-                        return ArrayTypeRef(ScalarType.REAL64, rank=self._infer_shape_arg_rank(expr.args[0]))
-                    return ArrayTypeRef(ScalarType.REAL64)
+                        return ArrayTypeRef(element_type, rank=self._infer_shape_arg_rank(expr.args[0]))
+                    return ArrayTypeRef(element_type)
                 if chain == ["np", "arange"]:
+                    if expr.args and all(self._infer_type(arg) == ScalarType.INTEGER for arg in expr.args):
+                        return ArrayTypeRef(ScalarType.INTEGER)
                     return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "linspace"]:
                     return ArrayTypeRef(ScalarType.REAL64)
                 if chain == ["np", "column_stack"]:
                     return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "concatenate"] or chain == ["np", "hstack"] or chain == ["np", "vstack"]:
+                    first_type = self._infer_type(expr.args[0].elts[0]) if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) and expr.args[0].elts else ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    if isinstance(first_type, ArrayTypeRef):
+                        return ArrayTypeRef(first_type.element_type, rank=2)
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
+                if chain == ["np", "stack"]:
+                    first_type = self._infer_type(expr.args[0].elts[0]) if expr.args and isinstance(expr.args[0], (ast.List, ast.Tuple)) and expr.args[0].elts else ArrayTypeRef(ScalarType.REAL64, rank=2)
+                    element_type = first_type.element_type if isinstance(first_type, ArrayTypeRef) else ScalarType.REAL64
+                    return ArrayTypeRef(element_type, rank=3)
                 if chain == ["np", "round"]:
                     arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
+                    return arg_type
+                if chain == ["np", "swapaxes"]:
+                    arg_type = self._infer_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.REAL64, rank=2)
                     return arg_type
                 if chain == ["np", "linalg", "solve"]:
                     return ArrayTypeRef(ScalarType.REAL64)
@@ -1874,21 +2921,30 @@ class PythonNumpyFrontend:
                     return RecordTypeRef("ac_random_state")
                 if chain[:1] == ["math"]:
                     return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_loadtxt_1d":
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
             if isinstance(expr.func, ast.Name):
-                return self._function_result_types.get(expr.func.id, ScalarType.REAL64)
+                return self._infer_user_call_result_type(expr.func.id, list(expr.args)) or self._function_result_types.get(expr.func.id, ScalarType.REAL64)
             return ScalarType.REAL64
         if isinstance(expr, ast.Name):
             return self._current_symbols.get(expr.id, ScalarType.REAL64)
         if isinstance(expr, ast.Attribute):
             if self._numpy_dtype_name(expr) is not None:
                 return ScalarType.STRING
+            if self._infer_contiguity_flag(expr) is not None:
+                return ScalarType.LOGICAL
             if self._attr_chain(expr) == ["np", "inf"]:
+                return ScalarType.REAL64
+            if self._attr_chain(expr) == ["np", "nan"]:
                 return ScalarType.REAL64
             if self._attr_chain(expr) == ["np", "pi"]:
                 return ScalarType.REAL64
             if self._attr_chain(expr) == ["sys", "argv"]:
                 return ArrayTypeRef(ScalarType.STRING)
             if expr.attr == "T":
+                base_type = self._infer_type(expr.value)
+                if isinstance(base_type, ArrayTypeRef):
+                    return base_type
                 return ArrayTypeRef(ScalarType.REAL64, rank=2)
             if expr.attr in {"size", "ndim"}:
                 return ScalarType.INTEGER
@@ -1910,7 +2966,14 @@ class PythonNumpyFrontend:
             right_type = self._infer_type(expr.right)
             if isinstance(expr.op, ast.MatMult):
                 return self._infer_matmul_type(left_type, right_type)
+            if isinstance(expr.op, ast.Add) and (left_type == ScalarType.STRING or right_type == ScalarType.STRING):
+                return ScalarType.STRING
             if isinstance(left_type, ArrayTypeRef) or isinstance(right_type, ArrayTypeRef):
+                if isinstance(expr.op, (ast.BitAnd, ast.BitOr)):
+                    return self._combine_array_types(
+                        ArrayTypeRef(ScalarType.LOGICAL, getattr(left_type, "rank", 1)) if not isinstance(left_type, ArrayTypeRef) else left_type,
+                        ArrayTypeRef(ScalarType.LOGICAL, getattr(right_type, "rank", 1)) if not isinstance(right_type, ArrayTypeRef) else right_type,
+                    )
                 return self._combine_array_types(left_type, right_type)
             left_type = self._infer_type(expr.left)
             right_type = self._infer_type(expr.right)
@@ -1933,6 +2996,12 @@ class PythonNumpyFrontend:
     def _map_annotation(self, annotation: ast.AST | None, function_name: str) -> object | None:
         if annotation is None:
             return None
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            try:
+                parsed = ast.parse(annotation.value, mode="eval")
+            except SyntaxError:
+                return None
+            return self._map_annotation(parsed.body, function_name)
         if isinstance(annotation, ast.Name):
             mapping = {
                 "float": ScalarType.REAL64,
@@ -1944,6 +3013,14 @@ class PythonNumpyFrontend:
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return None
         if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
+            if annotation.value.id == "Final":
+                return self._map_annotation(annotation.slice, function_name)
+            if annotation.value.id in {"Array1D", "Array2D", "Array3D"}:
+                rank = {"Array1D": 1, "Array2D": 2, "Array3D": 3}[annotation.value.id]
+                element_type = self._map_annotation(annotation.slice, function_name) or ScalarType.REAL64
+                if isinstance(element_type, ArrayTypeRef):
+                    element_type = element_type.element_type
+                return ArrayTypeRef(element_type, rank=rank)
             if annotation.value.id == "list":
                 element_type = self._map_annotation(annotation.slice, function_name) or ScalarType.REAL64
                 return ArrayTypeRef(element_type)
@@ -2043,6 +3120,10 @@ class PythonNumpyFrontend:
         if isinstance(expr, ast.List):
             if expr.elts and isinstance(expr.elts[0], ast.List):
                 return 2
+            if expr.elts:
+                first_type = self._infer_type(expr.elts[0])
+                if isinstance(first_type, ArrayTypeRef):
+                    return first_type.rank + 1
             return 1
         if isinstance(expr, ast.Name):
             inferred = self._current_symbols.get(expr.id)
@@ -2068,7 +3149,10 @@ class PythonNumpyFrontend:
         return 1
 
     def _shape_record_type(self, expr: ast.AST | None, minimum_rank: int = 1) -> RecordTypeRef:
-        rank = self._infer_array_rank(expr) if expr is not None else minimum_rank
+        if isinstance(expr, (ast.Tuple, ast.List)):
+            rank = len(expr.elts)
+        else:
+            rank = self._infer_array_rank(expr) if expr is not None else minimum_rank
         rank = max(rank, minimum_rank)
         name = f"ac_shape_{rank}d"
         fields = [(f"item{index}", ScalarType.INTEGER) for index in range(1, rank + 1)]
@@ -2086,6 +3170,8 @@ class PythonNumpyFrontend:
         return None
 
     def _numpy_dtype_name(self, expr: ast.AST) -> str | None:
+        if isinstance(expr, ast.Name) and expr.id in {"int", "float"}:
+            return expr.id
         if not isinstance(expr, ast.Attribute):
             return None
         chain = self._attr_chain(expr)
@@ -2112,6 +3198,43 @@ class PythonNumpyFrontend:
             return self._infer_dtype_name(expr.left) or self._infer_dtype_name(expr.right)
         if isinstance(expr, ast.Name):
             return self._current_dtypes.get(expr.id)
+        return None
+
+    def _infer_numpy_array_element_type(self, expr: ast.Call) -> object:
+        dtype_name = self._infer_dtype_name(expr)
+        if dtype_name in {"int32", "int64", "int"}:
+            return ScalarType.INTEGER
+        if dtype_name in {"float32", "float64", "float"}:
+            return ScalarType.REAL64
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and self._attr_chain(expr.func) == ["np", "full"]
+            and len(expr.args) >= 2
+        ):
+            return self._infer_literal_array_element_type(expr.args[1]) or self._infer_type(expr.args[1]) or ScalarType.REAL64
+        if expr.args:
+            return self._infer_literal_array_element_type(expr.args[0]) or ScalarType.REAL64
+        return ScalarType.REAL64
+
+    def _infer_literal_array_element_type(self, expr: ast.AST) -> object | None:
+        if isinstance(expr, ast.List):
+            element_types = [self._infer_literal_array_element_type(elt) for elt in expr.elts]
+            element_types = [elt for elt in element_types if elt is not None]
+            if element_types and all(elt == ScalarType.STRING for elt in element_types):
+                return ScalarType.STRING
+            if element_types and all(elt == ScalarType.INTEGER for elt in element_types):
+                return ScalarType.INTEGER
+            if element_types:
+                return ScalarType.REAL64
+        if isinstance(expr, ast.Constant):
+            if isinstance(expr.value, bool):
+                return ScalarType.LOGICAL
+            if isinstance(expr.value, str):
+                return ScalarType.STRING
+            if isinstance(expr.value, int):
+                return ScalarType.INTEGER
+            if isinstance(expr.value, float):
+                return ScalarType.REAL64
         return None
 
     def _is_shape_dim_access(self, expr: ast.Subscript) -> bool:
@@ -2204,10 +3327,21 @@ class PythonNumpyFrontend:
 
     def _combine_array_types(self, left_type: object, right_type: object) -> object:
         if isinstance(left_type, ArrayTypeRef) and isinstance(right_type, ArrayTypeRef):
-            element_type = ScalarType.COMPLEX128 if (
+            if left_type.element_type == right_type.element_type:
+                element_type = left_type.element_type
+            elif (
                 left_type.element_type == ScalarType.COMPLEX128
                 or right_type.element_type == ScalarType.COMPLEX128
-            ) else ScalarType.REAL64
+            ):
+                element_type = ScalarType.COMPLEX128
+            elif left_type.element_type == ScalarType.REAL64 or right_type.element_type == ScalarType.REAL64:
+                element_type = ScalarType.REAL64
+            elif left_type.element_type == ScalarType.INTEGER and right_type.element_type == ScalarType.INTEGER:
+                element_type = ScalarType.INTEGER
+            elif left_type.element_type == ScalarType.LOGICAL and right_type.element_type == ScalarType.LOGICAL:
+                element_type = ScalarType.LOGICAL
+            else:
+                element_type = ScalarType.REAL64
             return ArrayTypeRef(element_type, rank=max(left_type.rank, right_type.rank))
         if isinstance(left_type, ArrayTypeRef):
             return ArrayTypeRef(left_type.element_type, rank=left_type.rank)
@@ -2227,9 +3361,9 @@ class PythonNumpyFrontend:
         if isinstance(current, RecordTypeRef) or isinstance(new_type, RecordTypeRef):
             return new_type if isinstance(new_type, RecordTypeRef) else current
         if current == ScalarType.REAL64 and new_type == ScalarType.INTEGER:
-            return ScalarType.INTEGER
+            return ScalarType.REAL64
         if current == ScalarType.INTEGER and new_type == ScalarType.REAL64:
-            return ScalarType.INTEGER
+            return ScalarType.REAL64
         return new_type
 
     def _infer_matmul_type(self, left_type: object, right_type: object) -> object:
@@ -2249,6 +3383,7 @@ class PythonNumpyFrontend:
             and isinstance(expr.test.left.func, ast.Name)
             and expr.test.left.func.id == "len"
             and len(expr.test.left.args) == 1
+            and isinstance(expr.test.left.args[0], ast.Attribute)
             and self._attr_chain(expr.test.left.args[0]) == ["sys", "argv"]
             and isinstance(expr.body, ast.Subscript)
             and isinstance(expr.body.value, ast.Attribute)
@@ -2281,6 +3416,84 @@ class PythonNumpyFrontend:
             and len(expr.args) == 1
         )
 
+    def _is_meshgrid_call(self, expr: ast.AST) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and self._attr_chain(expr.func) == ["np", "meshgrid"]
+            and len(expr.args) >= 2
+        )
+
+    def _is_histogram_call(self, expr: ast.AST) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and self._attr_chain(expr.func) == ["np", "histogram"]
+            and len(expr.args) >= 1
+        )
+
+    def _is_eig_call(self, expr: ast.AST) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and self._attr_chain(expr.func) == ["np", "linalg", "eig"]
+            and len(expr.args) == 1
+        )
+
+    def _is_svd_call(self, expr: ast.AST) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and self._attr_chain(expr.func) == ["np", "linalg", "svd"]
+            and len(expr.args) == 1
+        )
+
+    def _lower_histogram_bins(self, expr: ast.Call) -> object:
+        bins_expr = self._keyword_value(expr, "bins")
+        if bins_expr is None:
+            raise NotImplementedError("np.histogram currently requires explicit bins=")
+        return self._lower_expr(bins_expr)
+
+    def _infer_contiguity_flag(self, expr: ast.Attribute) -> bool | None:
+        if expr.attr not in {"c_contiguous", "f_contiguous"}:
+            return None
+        if not isinstance(expr.value, ast.Attribute) or expr.value.attr != "flags":
+            return None
+        contiguity = self._infer_contiguity(expr.value.value)
+        if contiguity is None:
+            return None
+        return contiguity[0] if expr.attr == "c_contiguous" else contiguity[1]
+
+    def _infer_contiguity(self, expr: ast.AST) -> tuple[bool, bool] | None:
+        if isinstance(expr, ast.Name):
+            return self._current_contiguity.get(expr.id)
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            chain = self._attr_chain(expr.func)
+            if chain == ["np", "array"] or chain == ["np", "zeros"] or chain == ["np", "ones"] or chain == ["np", "full"] or chain == ["np", "empty"]:
+                return (True, False)
+            if chain == ["np", "arange"] or chain == ["np", "linspace"]:
+                return (True, True)
+            if chain == ["np", "ascontiguousarray"]:
+                return (True, False)
+            if chain == ["np", "asfortranarray"]:
+                return (False, True)
+            if expr.func.attr == "reshape" and chain[:1] != ["np"]:
+                order_ast = self._keyword_value(expr, "order")
+                if isinstance(order_ast, ast.Constant) and order_ast.value == "F":
+                    return (False, True)
+                return (True, False)
+            if expr.func.attr == "transpose" and chain[:1] != ["np"]:
+                base = self._infer_contiguity(expr.func.value)
+                if base is None:
+                    return None
+                return (base[1], base[0])
+        if isinstance(expr, ast.Attribute) and expr.attr == "T":
+            base = self._infer_contiguity(expr.value)
+            if base is None:
+                return None
+            return (base[1], base[0])
+        return None
+
     def _is_identity_asarray_assignment(self, stmt: ast.Assign) -> bool:
         return (
             len(stmt.targets) == 1
@@ -2294,15 +3507,7 @@ class PythonNumpyFrontend:
         )
 
     def _lower_slice_expr(self, expr: ast.Subscript) -> object | None:
-        if self._is_1d_slice(expr):
-            return Call(
-                "ac_slice",
-                (
-                    self._lower_expr(expr.value),
-                    self._lower_expr(expr.slice.lower) if expr.slice.lower is not None else Constant(0),
-                    self._lower_expr(expr.slice.upper) if expr.slice.upper is not None else Call("size", (self._lower_expr(expr.value),)),
-                ),
-            )
+        container_type = self._infer_type(expr.value)
         if (
             isinstance(expr.slice, ast.Slice)
             and expr.slice.lower is None
@@ -2313,11 +3518,50 @@ class PythonNumpyFrontend:
             and expr.slice.step.operand.value == 1
         ):
             return Call("ac_reverse", (self._lower_expr(expr.value),))
+        if isinstance(expr.slice, ast.Slice) and isinstance(container_type, ArrayTypeRef) and container_type.rank == 2:
+            base = self._lower_expr(expr.value)
+            row_start = self._lower_expr(expr.slice.lower) if expr.slice.lower is not None else Constant(0)
+            row_stop = self._lower_expr(expr.slice.upper) if expr.slice.upper is not None else Call("ac_shape_dim", (base, Constant(1)))
+            row_step = self._lower_expr(expr.slice.step) if expr.slice.step is not None else Constant(1)
+            return Call(
+                "ac_slice2",
+                (
+                    base,
+                    row_start,
+                    row_stop,
+                    row_step,
+                    Constant(0),
+                    Call("ac_shape_dim", (base, Constant(2))),
+                    Constant(1),
+                ),
+            )
+        if self._is_1d_slice(expr):
+            args = [
+                self._lower_expr(expr.value),
+                self._lower_expr(expr.slice.lower) if expr.slice.lower is not None else Constant(0),
+                self._lower_expr(expr.slice.upper) if expr.slice.upper is not None else Call("size", (self._lower_expr(expr.value),)),
+            ]
+            if expr.slice.step is not None:
+                args.append(self._lower_expr(expr.slice.step))
+                return Call("ac_slice_step", tuple(args))
+            return Call("ac_slice", tuple(args))
         if isinstance(expr.slice, ast.Tuple) and len(expr.slice.elts) == 2:
             row_spec, col_spec = expr.slice.elts
+            if isinstance(row_spec, ast.Slice) and isinstance(col_spec, ast.Slice):
+                base = self._lower_expr(expr.value)
+                row_start = self._lower_expr(row_spec.lower) if row_spec.lower is not None else Constant(0)
+                row_stop = self._lower_expr(row_spec.upper) if row_spec.upper is not None else Call("ac_shape_dim", (base, Constant(1)))
+                row_step = self._lower_expr(row_spec.step) if row_spec.step is not None else Constant(1)
+                col_start = self._lower_expr(col_spec.lower) if col_spec.lower is not None else Constant(0)
+                col_stop = self._lower_expr(col_spec.upper) if col_spec.upper is not None else Call("ac_shape_dim", (base, Constant(2)))
+                col_step = self._lower_expr(col_spec.step) if col_spec.step is not None else Constant(1)
+                return Call("ac_slice2", (base, row_start, row_stop, row_step, col_start, col_stop, col_step))
+            if isinstance(row_spec, ast.Constant) and row_spec.value is None:
+                if isinstance(col_spec, ast.Slice) and col_spec.lower is None and col_spec.upper is None and col_spec.step is None:
+                    return Call("ac_row_axis", (Call("ac_asarray", (self._lower_expr(expr.value),)),))
             if isinstance(row_spec, ast.Slice) and row_spec.lower is None and row_spec.upper is None and row_spec.step is None:
                 if isinstance(col_spec, ast.Constant) and col_spec.value is None:
-                    return Call("ac_add_axis", (self._lower_expr(expr.value),))
+                    return Call("ac_add_axis", (Call("ac_asarray", (self._lower_expr(expr.value),)),))
                 if isinstance(col_spec, ast.Name) or isinstance(col_spec, ast.Constant):
                     return Call("ac_column", (self._lower_expr(expr.value), self._lower_expr(col_spec)))
             if (
@@ -2332,7 +3576,7 @@ class PythonNumpyFrontend:
         return None
 
     def _lower_slice_assignment(self, target: ast.Subscript, value: object) -> object | None:
-        if self._is_1d_slice(target):
+        if self._is_1d_slice(target) and target.slice.step is None:
             func_name = "ac_set_slice" if isinstance(self._infer_ir_type(value), ArrayTypeRef) else "ac_fill_slice"
             return ExprStatement(
                 Call(
@@ -2358,6 +3602,10 @@ class PythonNumpyFrontend:
         return None
 
     def _infer_slice_type(self, expr: ast.Subscript) -> object | None:
+        if isinstance(expr.slice, ast.Slice):
+            container_type = self._infer_type(expr.value)
+            if isinstance(container_type, ArrayTypeRef) and container_type.rank == 2:
+                return ArrayTypeRef(container_type.element_type, rank=2)
         if self._is_1d_slice(expr):
             container_type = self._infer_type(expr.value)
             if isinstance(container_type, ArrayTypeRef):
@@ -2376,6 +3624,13 @@ class PythonNumpyFrontend:
                 return container_type
         if isinstance(expr.slice, ast.Tuple) and len(expr.slice.elts) == 2:
             row_spec, col_spec = expr.slice.elts
+            if isinstance(row_spec, ast.Slice) and isinstance(col_spec, ast.Slice):
+                container_type = self._infer_type(expr.value)
+                if isinstance(container_type, ArrayTypeRef):
+                    return ArrayTypeRef(container_type.element_type, rank=2)
+            if isinstance(row_spec, ast.Constant) and row_spec.value is None:
+                if isinstance(col_spec, ast.Slice) and col_spec.lower is None and col_spec.upper is None and col_spec.step is None:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=2)
             if isinstance(row_spec, ast.Slice) and row_spec.lower is None and row_spec.upper is None and row_spec.step is None:
                 if isinstance(col_spec, (ast.Name, ast.Constant)) and not (isinstance(col_spec, ast.Constant) and col_spec.value is None):
                     return ArrayTypeRef(ScalarType.REAL64)
@@ -2386,7 +3641,10 @@ class PythonNumpyFrontend:
     def _is_1d_slice(self, expr: ast.Subscript) -> bool:
         return (
             isinstance(expr.slice, ast.Slice)
-            and expr.slice.step is None
+            and (
+                not isinstance(self._infer_type(expr.value), ArrayTypeRef)
+                or self._infer_type(expr.value).rank == 1
+            )
         )
 
     def _is_item2_access(self, expr: ast.Subscript) -> bool:
@@ -2394,12 +3652,43 @@ class PythonNumpyFrontend:
             isinstance(expr.slice, ast.Tuple)
             and len(expr.slice.elts) == 2
             and not any(isinstance(elt, ast.Slice) for elt in expr.slice.elts)
+            and not self._is_pairwise_item2_access(expr)
             and isinstance(self._infer_type(expr.value), ArrayTypeRef)
             and self._infer_type(expr.value).rank == 2
         )
 
+    def _is_pairwise_item2_access(self, expr: ast.Subscript) -> bool:
+        if not (
+            isinstance(expr.slice, ast.Tuple)
+            and len(expr.slice.elts) == 2
+            and not any(isinstance(elt, ast.Slice) for elt in expr.slice.elts)
+            and isinstance(self._infer_type(expr.value), ArrayTypeRef)
+            and self._infer_type(expr.value).rank == 2
+        ):
+            return False
+        row_type = self._infer_type(expr.slice.elts[0])
+        col_type = self._infer_type(expr.slice.elts[1])
+        return isinstance(row_type, ArrayTypeRef) and isinstance(col_type, ArrayTypeRef)
+
+    def _is_item3_access(self, expr: ast.Subscript) -> bool:
+        return (
+            isinstance(expr.slice, ast.Tuple)
+            and len(expr.slice.elts) == 3
+            and not any(isinstance(elt, ast.Slice) for elt in expr.slice.elts)
+            and isinstance(self._infer_type(expr.value), ArrayTypeRef)
+            and self._infer_type(expr.value).rank == 3
+        )
+
     def _is_np_r_concat(self, expr: ast.Subscript) -> bool:
         return isinstance(expr.value, ast.Attribute) and self._attr_chain(expr.value) == ["np", "r_"]
+
+    def _is_boolean_mask_access(self, expr: ast.Subscript) -> bool:
+        return (
+            not isinstance(expr.slice, ast.Tuple)
+            and isinstance(self._infer_type(expr.value), ArrayTypeRef)
+            and isinstance(self._infer_type(expr.slice), ArrayTypeRef)
+            and self._infer_type(expr.slice).element_type == ScalarType.LOGICAL
+        )
 
     def _lower_np_r_concat(self, expr: ast.Subscript) -> object:
         items: list[ast.AST]
@@ -2414,3 +3703,5 @@ class PythonNumpyFrontend:
         for item in lowered[1:]:
             current = Call("ac_r_concat", (current, item))
         return current
+
+

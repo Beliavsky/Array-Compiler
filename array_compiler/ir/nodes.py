@@ -36,6 +36,9 @@ class BinaryOperator(str, Enum):
     MUL = "*"
     DIV = "/"
     POW = "**"
+    MOD = "%"
+    AND = ".and."
+    OR = ".or."
 
 
 class UnaryOperator(str, Enum):

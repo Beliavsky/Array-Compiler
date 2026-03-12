@@ -25,6 +25,7 @@ def _wrap_line(line: str, max_len: int) -> list[str]:
     available = max_len - len(continuation_prefix)
 
     while len(current) > max_len:
+        previous = current
         split = _find_split_point(current, max_len - 3)
         if split is None:
             return [line]
@@ -37,6 +38,8 @@ def _wrap_line(line: str, max_len: int) -> list[str]:
             right = current[split_at:].lstrip()
         pieces.append(f"{left} &")
         current = continuation_prefix + right
+        if len(current) >= len(previous):
+            return [line]
         if len(current) <= max_len:
             pieces.append(current)
             return pieces
@@ -50,7 +53,7 @@ def _wrap_line(line: str, max_len: int) -> list[str]:
 def _find_split_point(line: str, limit: int) -> tuple[int, bool] | None:
     in_single = False
     in_double = False
-    best: tuple[int, bool] | None = None
+    best: tuple[int, int, bool] | None = None
     for idx, ch in enumerate(line):
         if idx > limit:
             break
@@ -67,16 +70,30 @@ def _find_split_point(line: str, limit: int) -> tuple[int, bool] | None:
         if in_single or in_double:
             continue
         if ch.isspace():
-            best = (idx, False)
+            left_text = line[:idx].rstrip().lower()
+            if left_text.endswith(".or.") or left_text.endswith(".and."):
+                candidate = (3, idx, False)
+            else:
+                candidate = (1, idx, False)
+            if best is None or candidate >= best:
+                best = candidate
             continue
         if ch in ",)]":
-            best = (idx, True)
+            candidate = (2, idx, True)
+            if best is None or candidate >= best:
+                best = candidate
             continue
-        if ch in "+-*=":
-            best = (idx, False)
+        if ch in "+-*":
+            candidate = (0, idx, False)
+            if best is None or candidate >= best:
+                best = candidate
             continue
         if ch == "/" and not (
             (idx > 0 and line[idx - 1] == "/") or (idx + 1 < len(line) and line[idx + 1] == "/")
         ):
-            best = (idx, False)
-    return best
+            candidate = (0, idx, False)
+            if best is None or candidate >= best:
+                best = candidate
+    if best is None:
+        return None
+    return best[1], best[2]

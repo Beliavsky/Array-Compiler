@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 
 from ...ir.module import Module
@@ -47,6 +48,8 @@ from .helpers import HelperRegistry
 AC_NUMPY_FUNCS = {
     "ac_array",
     "ac_asarray",
+    "ac_astype_float",
+    "ac_astype_int",
     "ac_ndim",
     "ac_shape_dim",
     "ac_empty",
@@ -54,6 +57,7 @@ AC_NUMPY_FUNCS = {
     "ac_choice_weighted",
     "ac_choice_no_replace",
     "ac_where",
+    "ac_mask",
     "ac_row",
     "ac_take_rows",
     "ac_set_row",
@@ -62,24 +66,43 @@ AC_NUMPY_FUNCS = {
     "ac_multivariate_normal",
     "ac_savetxt",
     "ac_loadtxt",
+    "ac_loadtxt_1d",
+    "ac_file_exists",
     "ac_cov_rowvar_false",
     "ac_slogdet",
     "ac_inv",
+    "ac_cholesky",
     "ac_einsum_ni_ij_nj_to_n",
     "ac_matmul",
     "ac_transpose",
+    "ac_transpose_perm",
+    "ac_swapaxes",
     "ac_atleast_2d",
     "ac_sum_axis",
+    "ac_mean_axis",
+    "ac_min_axis",
     "ac_max_axis",
+    "ac_argmin",
+    "ac_argmax",
+    "ac_argmin_axis",
+    "ac_argmax_axis",
+    "ac_var",
+    "ac_std",
     "ac_argsort",
+    "ac_sort",
+    "ac_unique",
+    "ac_bincount",
+    "ac_searchsorted_left",
+    "ac_searchsorted_right",
     "ac_column",
     "ac_add_axis",
     "ac_set_column",
     "ac_full",
-    "ac_copy",
     "ac_sub_col",
     "ac_mul_col",
     "ac_reverse",
+    "ac_sign",
+    "ac_row_axis",
     "ac_r_concat",
     "ac_roots",
     "ac_normal_vec",
@@ -88,15 +111,65 @@ AC_NUMPY_FUNCS = {
     "ac_dot",
     "ac_mean",
     "ac_slice",
+    "ac_slice_step",
     "ac_set_slice",
     "ac_fill_slice",
     "ac_arange",
     "ac_arange_int",
+    "ac_linspace",
+    "ac_cumsum",
+    "ac_cumprod",
+    "ac_diff",
+    "ac_gradient",
     "ac_column_stack",
     "ac_round",
+    "ac_clip",
+    "ac_repeat",
+    "ac_repeat_axis",
+    "ac_tile",
+    "ac_diag",
+    "ac_diag_k",
+    "ac_triu",
+    "ac_tril",
+    "ac_trace",
+    "ac_outer",
+    "ac_kron",
+    "ac_concatenate_axis0",
+    "ac_concatenate_axis1",
+    "ac_hstack",
+    "ac_vstack",
+    "ac_stack_axis0",
+    "ac_stack_axis2",
+    "ac_any",
+    "ac_norm",
     "ac_solve_linear",
+    "ac_solve_linear_fallback",
+    "ac_take",
+    "ac_put",
+    "ac_pad",
+    "ac_roll",
+    "ac_floor",
+    "ac_ceil",
+    "ac_isnan",
+    "ac_nansum",
+    "ac_nan",
+    "ac_random_integers",
+    "ac_shuffle",
+    "ac_choice_replace",
+    "ac_reduceat_add",
+    "ac_histogram_counts",
+    "ac_histogram_edges",
+    "ac_det",
     "ac_item2",
     "ac_set_item2",
+    "ac_pick2",
+    "ac_set_pick2",
+    "ac_slice2",
+}
+
+AC_LAPACK_FUNCS = {
+    "ac_eig",
+    "ac_svd",
 }
 
 
@@ -128,6 +201,7 @@ class FortranBackend:
             f"module {module.name}",
             *self._emit_use_lines(helper_keys),
             "implicit none",
+            "character(len=:), allocatable :: ac_argv(:)",
             "",
         ]
         lines.extend(self._emit_visibility_lines(module, export_names))
@@ -138,6 +212,8 @@ class FortranBackend:
             "contains",
             "",
         ])
+        lines.extend(self._emit_ac_init_argv())
+        lines.append("")
         for fn in module.functions:
             lines.extend(self._emit_function(fn))
             lines.append("")
@@ -149,16 +225,20 @@ class FortranBackend:
 
     def _emit_use_lines(self, helper_keys: set[str]) -> list[str]:
         lines: list[str] = ["use kind_mod, only: dp"]
+        if "ac_constants" in helper_keys:
+            lines.append("use ac_constants_mod, only: ac_pi, ac_e")
         if "ac_string" in helper_keys:
             lines.append(
                 "use ac_string_mod, only: ac_lower, ac_format_default, ac_format_fixed, &"
             )
             lines.append("    & ac_format_scientific, ac_format_int, ac_format_array, &")
-            lines.append("    & ac_set_printoptions")
+            lines.append("    & ac_parse_int, ac_parse_real, ac_set_printoptions")
         if "ac_random" in helper_keys:
             lines.append("use ac_random_support, only: ac_random_state, ac_random_init, ac_gauss")
         if "ac_numpy" in helper_keys:
             lines.append("use ac_numpy_mod")
+        if "ac_lapack" in helper_keys:
+            lines.append("use ac_lapack_mod")
         return lines
 
     def _emit_visibility_lines(self, module: Module, export_names: list[str]) -> list[str]:
@@ -167,12 +247,31 @@ class FortranBackend:
         lines = ["private"]
         if export_names:
             lines.append("public :: " + ", ".join(export_names))
+        lines.append("public :: ac_init_argv")
         if module.records:
             lines.append("public :: " + ", ".join(record.name for record in module.records))
         if module.program is not None:
             lines.append(f"public :: {module.program.name}")
         lines.append("")
         return lines
+
+    def _emit_ac_init_argv(self) -> list[str]:
+        return [
+            "subroutine ac_init_argv()",
+            "integer :: argc, i, arg_len, current_len",
+            "argc = command_argument_count()",
+            "arg_len = 1",
+            "do i = 0, argc",
+            "    call get_command_argument(i, length=current_len)",
+            "    if (current_len > arg_len) arg_len = current_len",
+            "end do",
+            "if (allocated(ac_argv)) deallocate(ac_argv)",
+            "allocate(character(len=arg_len) :: ac_argv(argc + 1))",
+            "do i = 0, argc",
+            "    call get_command_argument(i, ac_argv(i + 1))",
+            "end do",
+            "end subroutine ac_init_argv",
+        ]
 
     def _emit_record(self, record) -> list[str]:
         lines = [f"type :: {record.name}"]
@@ -211,8 +310,9 @@ class FortranBackend:
             lines.extend(self._declare_locals(local_values))
             body = self._trim_terminal_return(body, "")
             body = [*init_body, *body]
-            for stmt in body:
-                lines.extend(self._emit_stmt(stmt, result_name=""))
+            body, extra_removable = self._rewrite_body(body, {name for name, _ in local_values})
+            local_values = self._prune_unused_locals(local_values, body, extra_removable)
+            lines.extend(self._emit_body(body, result_name=""))
             lines.append(f"end subroutine {fn.name}")
             self._current_symbols = previous_symbols
             self._mutated_args = previous_mutated_args
@@ -222,6 +322,15 @@ class FortranBackend:
         result_name = "result_value"
         arg_text = ", ".join(name for name, _ in emitted_args)
         prefix = (attrs + " ") if attrs else ""
+        body = self._trim_terminal_return(body, result_name)
+        body = [*init_body, *body]
+        body, extra_removable = self._rewrite_body(body, {name for name, _ in local_values})
+        local_values = self._prune_unused_locals(local_values, body, extra_removable)
+        result_name, local_values, body = self._adopt_terminal_result_local(
+            result_name,
+            local_values,
+            body,
+        )
         self._current_symbols = {name: typ for name, typ in fn.args}
         self._current_symbols.update({name: typ for name, typ in fn.locals})
         self._current_symbols[result_name] = fn.result_type
@@ -231,10 +340,7 @@ class FortranBackend:
         lines.append(self._declare_result(result_name, fn.result_type))
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
-        body = self._trim_terminal_return(body, result_name)
-        body = [*init_body, *body]
-        for stmt in body:
-            lines.extend(self._emit_stmt(stmt, result_name))
+        lines.extend(self._emit_body(body, result_name))
         lines.append(f"end function {fn.name}")
         self._current_symbols = previous_symbols
         self._mutated_args = previous_mutated_args
@@ -254,11 +360,91 @@ class FortranBackend:
         lines.extend(f"! {comment}" for comment in getattr(program, "leading_comments", []))
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
-        for stmt in body:
-            lines.extend(self._emit_stmt(stmt, result_name=""))
+        lines.extend(self._emit_body(body, result_name=""))
         lines.append(f"end subroutine {program.name}")
         self._current_symbols = previous_symbols
         return lines
+
+    def _emit_body(self, body: list[object], result_name: str) -> list[str]:
+        lines: list[str] = []
+        pending_blank = False
+        written_names: set[str] = set()
+        for stmt in body:
+            if isinstance(stmt, Print) and not stmt.values:
+                pending_blank = True
+                continue
+            allocate_lines = None
+            if isinstance(stmt, Assignment) and stmt.target.name not in written_names:
+                allocate_lines = self._emit_allocate_from_empty_assignment(stmt)
+            emitted = (
+                allocate_lines
+                if allocate_lines is not None
+                else (
+                    self._emit_stmt_with_blank_prefix(stmt, result_name)
+                    if pending_blank
+                    else self._emit_stmt(stmt, result_name)
+                )
+            )
+            if emitted:
+                lines.extend(emitted)
+                pending_blank = False
+            elif not isinstance(stmt, Comment):
+                pending_blank = False
+            written_names.update(self._stmt_written_names(stmt))
+        if pending_blank:
+            lines.append("print *")
+        return lines
+
+    def _emit_allocate_from_empty_assignment(self, stmt: Assignment) -> list[str] | None:
+        target_type = self._current_symbols.get(stmt.target.name)
+        if not (
+            isinstance(target_type, ArrayTypeRef)
+            and isinstance(stmt.value, Call)
+            and stmt.value.func in {"ac_empty", "ac_empty2"}
+        ):
+            return None
+        shape_args = ", ".join(self._emit_expr(arg) for arg in stmt.value.args)
+        return [f"allocate({stmt.target.name}({shape_args}))"]
+
+    def _stmt_written_names(self, stmt: object) -> set[str]:
+        names: set[str] = set()
+        if isinstance(stmt, Assignment):
+            names.add(stmt.target.name)
+        elif isinstance(stmt, AugmentedAssignment):
+            names.add(stmt.target.name)
+        elif isinstance(stmt, Append):
+            names.add(stmt.target.name)
+        elif isinstance(stmt, IndexAssignment):
+            if isinstance(stmt.target, ValueRef):
+                names.add(stmt.target.name)
+        elif isinstance(stmt, FieldAssignment):
+            if isinstance(stmt.target, ValueRef):
+                names.add(stmt.target.name)
+        elif isinstance(stmt, If):
+            for inner in stmt.body:
+                names.update(self._stmt_written_names(inner))
+            for inner in stmt.orelse:
+                names.update(self._stmt_written_names(inner))
+        elif isinstance(stmt, ForRange):
+            for inner in stmt.body:
+                names.update(self._stmt_written_names(inner))
+        elif isinstance(stmt, While):
+            for inner in stmt.body:
+                names.update(self._stmt_written_names(inner))
+        return names
+
+    def _emit_stmt_with_blank_prefix(self, stmt: object, result_name: str) -> list[str]:
+        if isinstance(stmt, Print):
+            if not stmt.values:
+                return ["print *"]
+            native_write = self._render_print_as_native_write(stmt.values, leading_blank=True)
+            if native_write is not None:
+                return [native_write]
+            rendered = [self._render_print_value(value) for value in stmt.values]
+            if all(is_string for _, is_string in rendered):
+                text = self._join_rendered_print_values(stmt.values, rendered)
+                return [f'write(*, "(/,a)") {text}']
+        return ["print *", *self._emit_stmt(stmt, result_name)]
 
     def _emit_stmt(self, stmt: object, result_name: str) -> list[str]:
         if isinstance(stmt, Assignment):
@@ -312,6 +498,8 @@ class FortranBackend:
                         f"{self._emit_expr(base)}({self._emit_plus_one(row_index)}, {self._emit_plus_one(col_index)}) = "
                         f"{self._emit_expr(value_expr)}"
                     ]
+                if stmt.expr.func == "ac_set_pick2" and len(stmt.expr.args) == 4:
+                    return [f"call ac_set_pick2({', '.join(self._emit_expr(arg) for arg in stmt.expr.args)})"]
                 if stmt.expr.func == "ac_fill_slice":
                     direct_stmt = self._emit_direct_slice_assignment(stmt.expr)
                     if direct_stmt is not None:
@@ -329,6 +517,12 @@ class FortranBackend:
                 return [f"call {stmt.expr.func}({', '.join(self._emit_expr(arg) for arg in stmt.expr.args)})"]
             raise NotImplementedError(f"unsupported expression statement: {stmt.expr!r}")
         if isinstance(stmt, If):
+            if isinstance(stmt.test, Constant) and isinstance(stmt.test.value, bool):
+                chosen = stmt.body if stmt.test.value else stmt.orelse
+                lines: list[str] = []
+                for inner in chosen:
+                    lines.extend(self._emit_stmt(inner, result_name))
+                return lines
             simple_body = len(stmt.body) == 1 and not stmt.orelse
             simple_stmt = stmt.body[0] if simple_body else None
             if simple_stmt is not None:
@@ -402,14 +596,33 @@ class FortranBackend:
         if isinstance(expr, Call):
             if expr.func == "ac_array_literal":
                 return self._emit_array_literal(expr.args, "")
+            if expr.func == "ac_shape" and expr.args:
+                shape_type = self._expr_type(expr)
+                if isinstance(shape_type, RecordTypeRef):
+                    record = self._record_types.get(shape_type.name)
+                    if record is not None:
+                        fields = ", ".join(
+                            f"{field_name}=ac_shape_dim({self._emit_expr(expr.args[0])}, {index})"
+                            for index, (field_name, _) in enumerate(record.fields, start=1)
+                        )
+                        return f"{shape_type.name}({fields})"
             if expr.func == "ac_array" and len(expr.args) == 1:
                 if self._is_nested_array_literal(expr.args[0]):
                     return self._emit_nested_array(expr.args[0])
                 if isinstance(expr.args[0], Call) and expr.args[0].func == "ac_array_literal":
                     return self._emit_array_literal(expr.args[0].args, "")
+                return self._emit_expr(expr.args[0])
             if expr.func == "ac_item2" and len(expr.args) == 3:
                 base, row_index, col_index = expr.args
                 return f"{self._emit_expr(base)}({self._emit_plus_one(row_index)}, {self._emit_plus_one(col_index)})"
+            if expr.func == "ac_pick2":
+                return f"ac_pick2({', '.join(self._emit_expr(arg) for arg in expr.args)})"
+            if expr.func == "ac_item3" and len(expr.args) == 4:
+                base, i0, i1, i2 = expr.args
+                return (
+                    f"{self._emit_expr(base)}("
+                    f"{self._emit_plus_one(i0)}, {self._emit_plus_one(i1)}, {self._emit_plus_one(i2)})"
+                )
             if expr.func == "ac_dot" and len(expr.args) == 2:
                 left, right = expr.args
                 if left == right:
@@ -417,8 +630,14 @@ class FortranBackend:
                 return f"sum({self._emit_expr(left)} * {self._emit_expr(right)})"
             if expr.func == "ac_r_concat":
                 return "[" + ", ".join(self._emit_expr(arg) for arg in expr.args) + "]"
+            if expr.func == "ac_copy" and len(expr.args) == 1:
+                return self._emit_expr(expr.args[0])
             if expr.func == "ac_slice":
                 direct_expr = self._emit_direct_slice_expr(expr)
+                if direct_expr is not None:
+                    return direct_expr
+            if expr.func == "ac_slice_step":
+                direct_expr = self._emit_direct_slice_step_expr(expr)
                 if direct_expr is not None:
                     return direct_expr
             if expr.func == "ac_reverse" and len(expr.args) == 1:
@@ -431,20 +650,67 @@ class FortranBackend:
                 base = self._emit_expr(expr.args[0])
                 return f"ac_reverse({base})"
             if expr.func == "ac_arange_int":
-                start_text = self._emit_expr(expr.args[0])
-                stop_text = self._emit_expr(expr.args[1])
-                return f"[( {start_text} + ac_i - 1, ac_i = 1, max(0, {stop_text} - {start_text}) )]"
+                args = ", ".join(self._emit_expr(arg) for arg in expr.args)
+                return f"ac_arange_int({args})"
+            if expr.func == "ac_transpose_perm":
+                args = ", ".join(self._emit_expr(arg) for arg in expr.args)
+                return f"ac_transpose_perm({args})"
+            if expr.func == "ac_swapaxes":
+                args = ", ".join(self._emit_expr(arg) for arg in expr.args)
+                return f"ac_swapaxes({args})"
+            if expr.func == "sum" and len(expr.args) == 1:
+                arg_type = self._expr_type(expr.args[0])
+                if arg_type == ScalarType.LOGICAL or (
+                    isinstance(arg_type, ArrayTypeRef) and arg_type.element_type == ScalarType.LOGICAL
+                ):
+                    return f"count({self._emit_expr(expr.args[0])})"
+                if isinstance(expr.args[0], Call) and expr.args[0].func == "ac_isnan":
+                    return f"count({self._emit_expr(expr.args[0])})"
+            if expr.func == "all" and len(expr.args) == 1:
+                arg_type = self._expr_type(expr.args[0])
+                if arg_type == ScalarType.LOGICAL:
+                    return self._emit_expr(expr.args[0])
+            if expr.func == "str" and len(expr.args) == 1:
+                arg_type = self._expr_type(expr.args[0])
+                if arg_type == ScalarType.STRING:
+                    return self._emit_expr(expr.args[0])
+                return f"ac_format_default({self._emit_expr(expr.args[0])})"
             if expr.func == "float":
                 return f"ac_float({self._emit_expr(expr.args[0])})"
             if expr.func == "ac_repeat":
-                return f"spread({self._emit_expr(expr.args[0])}, 1, {self._emit_expr(expr.args[1])})"
+                args = ", ".join(self._emit_expr(arg) for arg in expr.args)
+                return f"ac_repeat({args})"
             if expr.func == "ac_concat":
                 return "[" + ", ".join(self._emit_expr(arg) for arg in expr.args) + "]"
             args = ", ".join(self._emit_expr(arg) for arg in expr.args)
             return f"{expr.func}({args})"
         if isinstance(expr, BinaryOp):
+            rowwise_expr = self._emit_rowwise_binary(expr)
+            if rowwise_expr is not None:
+                return rowwise_expr
+            if expr.op == BinaryOperator.ADD:
+                left_type = self._expr_type(expr.left)
+                right_type = self._expr_type(expr.right)
+                if left_type == ScalarType.STRING or right_type == ScalarType.STRING:
+                    return (
+                        f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} "
+                        f"// "
+                        f"{self._emit_binary_operand(expr.right, expr.op, is_right=True)}"
+                    )
             if expr.op == BinaryOperator.POW:
                 return f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} ** {self._emit_binary_operand(expr.right, expr.op, is_right=True)}"
+            if expr.op == BinaryOperator.MOD:
+                left_type = self._expr_type(expr.left)
+                right_type = self._expr_type(expr.right)
+                right_text = self._emit_binary_operand(expr.right, expr.op, is_right=True)
+                if isinstance(left_type, ArrayTypeRef) and left_type.element_type == ScalarType.REAL64 and right_type == ScalarType.INTEGER:
+                    right_text = f"real({right_text}, dp)"
+                if left_type == ScalarType.REAL64 and right_type == ScalarType.INTEGER:
+                    right_text = f"real({right_text}, dp)"
+                return (
+                    f"modulo({self._emit_binary_operand(expr.left, expr.op, is_right=False)}, "
+                    f"{right_text})"
+                )
             return (
                 f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} "
                 f"{expr.op.value} "
@@ -452,7 +718,7 @@ class FortranBackend:
             )
         if isinstance(expr, UnaryOp):
             if expr.op == UnaryOperator.NOT:
-                return f".not. {self._emit_operand(expr.operand)}"
+                return f".not. {self._emit_logical_operand(expr.operand)}"
             return f"{expr.op.value}{self._emit_operand(expr.operand)}"
         if isinstance(expr, Compare):
             op_map = {
@@ -469,15 +735,112 @@ class FortranBackend:
                 right = Constant(-1)
             if isinstance(left, Constant) and left.value is None and self._expr_type(right) == ScalarType.INTEGER:
                 left = Constant(-1)
-            return f"{self._emit_operand(left)} {op_map[expr.op]} {self._emit_operand(right)}"
+            explicit_record_name = None
+            if isinstance(left, RecordLiteral) and isinstance(right, RecordLiteral) and left.type_name == right.type_name:
+                explicit_record_name = left.type_name
+            elif isinstance(left, Call) and left.func == "ac_shape" and isinstance(right, RecordLiteral):
+                explicit_record_name = right.type_name
+            elif isinstance(right, Call) and right.func == "ac_shape" and isinstance(left, RecordLiteral):
+                explicit_record_name = left.type_name
+            if expr.op in {CompareOperator.EQ, CompareOperator.NE} and explicit_record_name is not None:
+                record = self._record_types.get(explicit_record_name)
+                if record is not None:
+                    joiner = " .and. " if expr.op == CompareOperator.EQ else " .or. "
+                    terms = [
+                        (
+                            f"{self._emit_record_field_expr(left, field_name, index)} "
+                            f"{'==' if expr.op == CompareOperator.EQ else '/='} "
+                            f"{self._emit_record_field_expr(right, field_name, index)}"
+                        )
+                        for index, (field_name, _) in enumerate(record.fields, start=1)
+                    ]
+                    if terms:
+                        return "(" + joiner.join(terms) + ")"
+            left_type = self._expr_type(left)
+            right_type = self._expr_type(right)
+            if (
+                expr.op in {CompareOperator.EQ, CompareOperator.NE}
+                and isinstance(left_type, RecordTypeRef)
+                and isinstance(right_type, RecordTypeRef)
+                and left_type.name == right_type.name
+            ):
+                record = self._record_types.get(left_type.name)
+                if record is not None:
+                    joiner = " .and. " if expr.op == CompareOperator.EQ else " .or. "
+                    terms = [
+                        (
+                            f"{self._emit_record_field_expr(left, field_name, index)} "
+                            f"{'==' if expr.op == CompareOperator.EQ else '/='} "
+                            f"{self._emit_record_field_expr(right, field_name, index)}"
+                        )
+                        for index, (field_name, _) in enumerate(record.fields, start=1)
+                    ]
+                    if terms:
+                        return "(" + joiner.join(terms) + ")"
+            return f"{self._emit_compare_operand(left)} {op_map[expr.op]} {self._emit_compare_operand(right)}"
         if isinstance(expr, BooleanOp):
             op = ".and." if expr.op == "and" else ".or."
-            return f" {op} ".join(self._emit_operand(value) for value in expr.values)
+            return f" {op} ".join(self._emit_boolean_value(value, expr.op) for value in expr.values)
         if isinstance(expr, ConditionalExpr):
-            return f"merge({self._emit_expr(expr.body)}, {self._emit_expr(expr.orelse)}, {self._emit_expr(expr.test)})"
+            result_type = self._expr_type(expr)
+            body_type = self._expr_type(expr.body)
+            else_type = self._expr_type(expr.orelse)
+            body_text = self._emit_expr(expr.body)
+            else_text = self._emit_expr(expr.orelse)
+            if result_type == ScalarType.REAL64 or {body_type, else_type} == {ScalarType.INTEGER, ScalarType.REAL64}:
+                if body_type == ScalarType.INTEGER:
+                    body_text = f"real({body_text}, dp)"
+                if else_type == ScalarType.INTEGER:
+                    else_text = f"real({else_text}, dp)"
+            return f"merge({body_text}, {else_text}, {self._emit_expr(expr.test)})"
         if isinstance(expr, ListComprehension):
             return self._emit_list_comp(expr)
         return str(expr)
+
+    def _emit_rowwise_binary(self, expr: BinaryOp) -> str | None:
+        left_type = self._expr_type(expr.left)
+        right_type = self._expr_type(expr.right)
+        if (
+            isinstance(left_type, ArrayTypeRef)
+            and left_type.rank == 2
+            and isinstance(right_type, ArrayTypeRef)
+            and right_type.rank == 2
+            and isinstance(expr.left, Call)
+            and expr.left.func == "ac_add_axis"
+            and isinstance(expr.right, Call)
+            and expr.right.func == "ac_row_axis"
+        ):
+            col = f"spread({self._emit_expr(expr.left.args[0])}, 2, size({self._emit_expr(expr.right.args[0])}))"
+            row = f"spread({self._emit_expr(expr.right.args[0])}, 1, size({self._emit_expr(expr.left.args[0])}))"
+            return f"{col} {expr.op.value} {row}"
+        if (
+            isinstance(left_type, ArrayTypeRef)
+            and left_type.rank == 2
+            and isinstance(right_type, ArrayTypeRef)
+            and right_type.rank == 2
+            and isinstance(expr.left, Call)
+            and expr.left.func == "ac_row_axis"
+            and isinstance(expr.right, Call)
+            and expr.right.func == "ac_add_axis"
+        ):
+            row = f"spread({self._emit_expr(expr.left.args[0])}, 1, size({self._emit_expr(expr.right.args[0])}))"
+            col = f"spread({self._emit_expr(expr.right.args[0])}, 2, size({self._emit_expr(expr.left.args[0])}))"
+            return f"{row} {expr.op.value} {col}"
+        if isinstance(left_type, ArrayTypeRef) and left_type.rank == 2 and isinstance(right_type, ArrayTypeRef) and right_type.rank == 1:
+            spread = f"spread({self._emit_expr(expr.right)}, 1, size({self._emit_expr(expr.left)}, 1))"
+            return (
+                f"{self._emit_binary_operand(expr.left, expr.op, is_right=False)} "
+                f"{expr.op.value} "
+                f"{spread}"
+            )
+        if isinstance(left_type, ArrayTypeRef) and left_type.rank == 1 and isinstance(right_type, ArrayTypeRef) and right_type.rank == 2:
+            spread = f"spread({self._emit_expr(expr.left)}, 1, size({self._emit_expr(expr.right)}, 1))"
+            return (
+                f"{spread} "
+                f"{expr.op.value} "
+                f"{self._emit_binary_operand(expr.right, expr.op, is_right=True)}"
+            )
+        return None
 
     def _declare_args(self, values: list[tuple[str, object]]) -> list[str]:
         return self._coalesce_declarations(values, self._arg_decl_parts)
@@ -490,6 +853,36 @@ class FortranBackend:
             return None
         base = self._emit_expr(array_expr)
         return f"{base}({self._emit_slice_lower_bound(array_expr, start_expr)}:{self._emit_slice_upper_bound(array_expr, stop_expr)})"
+
+    def _emit_direct_slice_step_expr(self, expr: Call) -> str | None:
+        if len(expr.args) != 4:
+            return None
+        array_expr, start_expr, stop_expr, step_expr = expr.args
+        if (
+            not self._is_simple_slice_base(array_expr)
+            or not self._is_slice_expr(start_expr)
+            or not self._is_slice_expr(stop_expr)
+            or not self._is_slice_expr(step_expr)
+        ):
+            return None
+        step_value = self._const_int_expr_value(step_expr)
+        if step_value == 0:
+            return None
+        base = self._emit_expr(array_expr)
+        if step_value is not None and step_value > 0:
+            upper_expr = self._simplify_expr(
+                BinaryOp(stop_expr, BinaryOperator.SUB, Constant(1))
+            )
+            return (
+                f"{base}({self._emit_slice_lower_bound(array_expr, start_expr)}:"
+                f"{self._emit_slice_upper_bound(array_expr, upper_expr)}:{self._emit_expr(step_expr)})"
+            )
+        if step_value is not None and step_value < 0:
+            return (
+                f"{base}({self._emit_slice_upper_bound(array_expr, start_expr)}:"
+                f"{self._emit_slice_lower_bound(array_expr, stop_expr)}:{self._emit_expr(step_expr)})"
+            )
+        return None
 
     def _emit_direct_slice_assignment(self, expr: Call) -> str | None:
         if len(expr.args) != 4:
@@ -636,6 +1029,17 @@ class FortranBackend:
                 if expr.op == UnaryOperator.MINUS:
                     return Constant(-operand_value)
             return UnaryOp(expr.op, operand)
+        if isinstance(expr, BooleanOp):
+            simplified_values: list[object] = []
+            for value in expr.values:
+                simplified = self._simplify_expr(value)
+                if isinstance(simplified, BooleanOp) and simplified.op == expr.op:
+                    simplified_values.extend(simplified.values)
+                else:
+                    simplified_values.append(simplified)
+            if len(simplified_values) == 1:
+                return simplified_values[0]
+            return BooleanOp(expr.op, tuple(simplified_values))
         return expr
 
     def _const_int_expr_value(self, expr: object) -> int | None:
@@ -722,8 +1126,19 @@ class FortranBackend:
             shape = self._parameter_shape(value_expr)
             if shape is None:
                 raise NotImplementedError(f"parameter array shape could not be determined for {name}")
+            if value_type.element_type == ScalarType.STRING:
+                length = self._parameter_array_string_length(value_expr)
+                if length is None:
+                    raise NotImplementedError(f"parameter string array length could not be determined for {name}")
+                spec = f"character(len={length}), parameter"
+                return spec, f"{name}{shape} = {self._emit_parameter_value(value_expr)}"
             spec = f"{self._type_name(value_type.element_type)}, parameter"
             return spec, f"{name}{shape} = {self._emit_parameter_value(value_expr)}"
+        if value_type == ScalarType.STRING:
+            length = self._parameter_string_length(value_expr)
+            if length is None:
+                raise NotImplementedError(f"parameter string length could not be determined for {name}")
+            return f"character(len={length}), parameter", f'{name} = {self._emit_parameter_value(value_expr)}'
         return f"{self._type_name(value_type)}, parameter", f"{name} = {self._emit_parameter_value(value_expr)}"
 
     def _parameter_shape(self, value_expr: object) -> str | None:
@@ -737,6 +1152,21 @@ class FortranBackend:
         if isinstance(value_expr, Call) and value_expr.func == "ac_array" and len(value_expr.args) == 1:
             return self._emit_parameter_value(value_expr.args[0])
         return self._emit_expr(value_expr)
+
+    def _parameter_string_length(self, value_expr: object) -> int | None:
+        if isinstance(value_expr, Constant) and isinstance(value_expr.value, str):
+            return len(value_expr.value)
+        return None
+
+    def _parameter_array_string_length(self, value_expr: object) -> int | None:
+        if isinstance(value_expr, Call) and value_expr.func == "ac_array" and len(value_expr.args) == 1:
+            return self._parameter_array_string_length(value_expr.args[0])
+        if isinstance(value_expr, Call) and value_expr.func == "ac_array_literal":
+            lengths = [self._parameter_string_length(arg) for arg in value_expr.args]
+            if any(length is None for length in lengths):
+                return None
+            return max(lengths, default=0)
+        return None
 
     def _coalesce_declarations(self, values: list[tuple[str, object]], part_builder) -> list[str]:
         lines: list[str] = []
@@ -762,21 +1192,18 @@ class FortranBackend:
         parameter_values: dict[str, object] = {}
         parameter_assignment_indexes: set[int] = set()
         for index, stmt in enumerate(body):
-            if isinstance(stmt, Comment):
-                continue
             if not isinstance(stmt, Assignment):
-                break
+                continue
             name = stmt.target.name
             value_type = local_types.get(name)
             if (
-                self._is_parameter_candidate(value_type, stmt.value)
+                self._count_name_writes(body, name) == 1
+                and self._is_parameter_candidate(value_type, stmt.value)
                 and name not in parameter_names
             ):
                 parameter_names.add(name)
                 parameter_values[name] = stmt.value
                 parameter_assignment_indexes.add(index)
-                continue
-            break
         if not parameter_names:
             return [], locals_list, body
 
@@ -796,15 +1223,48 @@ class FortranBackend:
         ]
         return parameters, filtered_locals, filtered_body
 
+    def _count_name_writes(self, body: list[object], name: str) -> int:
+        count = 0
+        for stmt in body:
+            if isinstance(stmt, Assignment) and stmt.target.name == name:
+                count += 1
+            elif isinstance(stmt, AugmentedAssignment) and stmt.target.name == name:
+                count += 1
+            elif isinstance(stmt, Append) and stmt.target.name == name:
+                count += 1
+            elif isinstance(stmt, If):
+                count += self._count_name_writes(list(stmt.body), name)
+                count += self._count_name_writes(list(stmt.orelse), name)
+            elif isinstance(stmt, ForRange):
+                count += self._count_name_writes(list(stmt.body), name)
+            elif isinstance(stmt, While):
+                count += self._count_name_writes(list(stmt.body), name)
+        return count
+
     def _rewrite_body(self, body: list[object], local_names: set[str]) -> tuple[list[object], set[str]]:
         current = list(body)
         removable_locals: set[str] = set()
         changed = True
         while changed:
             changed = False
+            shifted = self._shift_simple_zero_based_loops(current)
+            if shifted != current:
+                current = shifted
+                changed = True
+            merged = self._merge_adjacent_identical_ifs(current)
+            if merged != current:
+                current = merged
+                changed = True
             rewritten: list[object] = []
             index = 0
             while index < len(current):
+                replacement = self._rewrite_copy_reshape_center(current, index)
+                if replacement is not None:
+                    new_stmt, consumed = replacement
+                    rewritten.append(new_stmt)
+                    index += consumed
+                    changed = True
+                    continue
                 replacement = self._rewrite_full_array_init(current, index)
                 if replacement is not None:
                     new_stmt, consumed = replacement
@@ -821,6 +1281,250 @@ class FortranBackend:
                 removable_locals.add(removed_name)
                 changed = True
         return current, removable_locals
+
+    def _rewrite_copy_reshape_center(self, body: list[object], index: int) -> tuple[object, int] | None:
+        if index + 2 >= len(body):
+            return None
+        copy_stmt = body[index]
+        reshape_stmt = body[index + 1]
+        center_stmt = body[index + 2]
+        if not (
+            isinstance(copy_stmt, Assignment)
+            and isinstance(copy_stmt.target, ValueRef)
+            and isinstance(copy_stmt.value, ValueRef)
+            and isinstance(reshape_stmt, Assignment)
+            and isinstance(reshape_stmt.target, ValueRef)
+            and reshape_stmt.target.name == copy_stmt.target.name
+            and isinstance(center_stmt, Assignment)
+            and isinstance(center_stmt.target, ValueRef)
+            and center_stmt.target.name == copy_stmt.target.name
+        ):
+            return None
+        target = copy_stmt.target.name
+        source = copy_stmt.value
+        if not (
+            isinstance(reshape_stmt.value, Call)
+            and reshape_stmt.value.func == "ac_reshape"
+            and len(reshape_stmt.value.args) == 2
+            and isinstance(reshape_stmt.value.args[0], Call)
+            and reshape_stmt.value.args[0].func == "ac_asarray"
+            and len(reshape_stmt.value.args[0].args) == 1
+            and isinstance(reshape_stmt.value.args[0].args[0], ValueRef)
+            and reshape_stmt.value.args[0].args[0].name == target
+            and self._is_minus_one_expr(reshape_stmt.value.args[1])
+        ):
+            return None
+        if not (
+            isinstance(center_stmt.value, BinaryOp)
+            and center_stmt.value.op == BinaryOperator.SUB
+            and isinstance(center_stmt.value.left, ValueRef)
+            and center_stmt.value.left.name == target
+            and isinstance(center_stmt.value.right, Call)
+            and center_stmt.value.right.func == "ac_mean"
+            and len(center_stmt.value.right.args) == 1
+            and isinstance(center_stmt.value.right.args[0], ValueRef)
+            and center_stmt.value.right.args[0].name == target
+        ):
+            return None
+        return (
+            Assignment(
+                ValueRef(target),
+                BinaryOp(source, BinaryOperator.SUB, Call("ac_mean", (source,))),
+            ),
+            3,
+        )
+
+    def _is_minus_one_expr(self, expr: object) -> bool:
+        if isinstance(expr, Constant):
+            return expr.value == -1
+        return (
+            isinstance(expr, UnaryOp)
+            and expr.op == UnaryOperator.MINUS
+            and isinstance(expr.operand, Constant)
+            and expr.operand.value == 1
+        )
+
+    def _shift_simple_zero_based_loops(self, body: list[object]) -> list[object]:
+        rewritten: list[object] = []
+        for stmt in body:
+            if isinstance(stmt, ForRange):
+                rewritten.append(self._shift_zero_based_loop(stmt))
+            elif isinstance(stmt, If):
+                rewritten.append(
+                    replace(
+                        stmt,
+                        body=tuple(self._shift_simple_zero_based_loops(list(stmt.body))),
+                        orelse=tuple(self._shift_simple_zero_based_loops(list(stmt.orelse))),
+                    )
+                )
+            elif isinstance(stmt, While):
+                rewritten.append(replace(stmt, body=tuple(self._shift_simple_zero_based_loops(list(stmt.body)))))
+            else:
+                rewritten.append(stmt)
+        return rewritten
+
+    def _shift_zero_based_loop(self, stmt: ForRange) -> ForRange:
+        rewritten_body = tuple(self._shift_simple_zero_based_loops(list(stmt.body)))
+        if stmt.step is not None:
+            return replace(stmt, body=rewritten_body)
+        if not isinstance(stmt.start, Constant) or stmt.start.value != 0:
+            return replace(stmt, body=rewritten_body)
+        if not self._loop_var_used_only_in_indices(rewritten_body, stmt.target):
+            return replace(stmt, body=rewritten_body)
+        shifted_body = tuple(
+            self._substitute_in_stmt(
+                inner,
+                stmt.target,
+                BinaryOp(ValueRef(stmt.target), BinaryOperator.SUB, Constant(1)),
+            )
+            for inner in rewritten_body
+        )
+        return replace(
+            stmt,
+            start=Constant(1),
+            stop=BinaryOp(stmt.stop, BinaryOperator.ADD, Constant(1)),
+            body=shifted_body,
+        )
+
+    def _loop_var_used_only_in_indices(self, body: tuple[object, ...], name: str) -> bool:
+        return all(self._stmt_uses_name_only_in_indices(stmt, name) for stmt in body)
+
+    def _stmt_uses_name_only_in_indices(self, stmt: object, name: str) -> bool:
+        if isinstance(stmt, Assignment):
+            return self._expr_uses_name_only_in_indices(stmt.value, name, False)
+        if isinstance(stmt, IndexAssignment):
+            return (
+                self._expr_uses_name_only_in_indices(stmt.target, name, False)
+                and self._expr_uses_name_only_in_indices(stmt.index, name, True)
+                and self._expr_uses_name_only_in_indices(stmt.value, name, False)
+            )
+        if isinstance(stmt, FieldAssignment):
+            return (
+                self._expr_uses_name_only_in_indices(stmt.target, name, False)
+                and self._expr_uses_name_only_in_indices(stmt.value, name, False)
+            )
+        if isinstance(stmt, AugmentedAssignment):
+            return self._expr_uses_name_only_in_indices(stmt.value, name, False)
+        if isinstance(stmt, Return):
+            return stmt.value is None or self._expr_uses_name_only_in_indices(stmt.value, name, False)
+        if isinstance(stmt, Raise | Break | Continue | Comment | Pass):
+            return True
+        if isinstance(stmt, Print):
+            return all(self._expr_uses_name_only_in_indices(value, name, False) for value in stmt.values)
+        if isinstance(stmt, ExprStatement):
+            return self._expr_uses_name_only_in_indices(stmt.expr, name, False)
+        if isinstance(stmt, If):
+            return (
+                self._expr_uses_name_only_in_indices(stmt.test, name, False)
+                and all(self._stmt_uses_name_only_in_indices(inner, name) for inner in stmt.body)
+                and all(self._stmt_uses_name_only_in_indices(inner, name) for inner in stmt.orelse)
+            )
+        if isinstance(stmt, ForRange):
+            return (
+                (stmt.start is None or self._expr_uses_name_only_in_indices(stmt.start, name, False))
+                and self._expr_uses_name_only_in_indices(stmt.stop, name, False)
+                and (stmt.step is None or self._expr_uses_name_only_in_indices(stmt.step, name, False))
+                and all(self._stmt_uses_name_only_in_indices(inner, name) for inner in stmt.body)
+            )
+        if isinstance(stmt, While):
+            return (
+                self._expr_uses_name_only_in_indices(stmt.test, name, False)
+                and all(self._stmt_uses_name_only_in_indices(inner, name) for inner in stmt.body)
+            )
+        return True
+
+    def _expr_uses_name_only_in_indices(self, expr: object, name: str, in_index: bool) -> bool:
+        if isinstance(expr, ValueRef):
+            return expr.name != name or in_index
+        if isinstance(expr, Constant):
+            return True
+        if isinstance(expr, FieldAccess):
+            return self._expr_uses_name_only_in_indices(expr.value, name, in_index)
+        if isinstance(expr, IndexAccess):
+            return (
+                self._expr_uses_name_only_in_indices(expr.value, name, False)
+                and self._expr_uses_name_only_in_indices(expr.index, name, True)
+            )
+        if isinstance(expr, BinaryOp):
+            return (
+                self._expr_uses_name_only_in_indices(expr.left, name, in_index)
+                and self._expr_uses_name_only_in_indices(expr.right, name, in_index)
+            )
+        if isinstance(expr, UnaryOp):
+            return self._expr_uses_name_only_in_indices(expr.operand, name, in_index)
+        if isinstance(expr, Compare):
+            return (
+                self._expr_uses_name_only_in_indices(expr.left, name, in_index)
+                and self._expr_uses_name_only_in_indices(expr.right, name, in_index)
+            )
+        if isinstance(expr, BooleanOp):
+            return all(self._expr_uses_name_only_in_indices(value, name, in_index) for value in expr.values)
+        if isinstance(expr, ConditionalExpr):
+            return (
+                self._expr_uses_name_only_in_indices(expr.test, name, in_index)
+                and self._expr_uses_name_only_in_indices(expr.body, name, in_index)
+                and self._expr_uses_name_only_in_indices(expr.orelse, name, in_index)
+            )
+        if isinstance(expr, RecordLiteral):
+            return all(self._expr_uses_name_only_in_indices(value, name, in_index) for _, value in expr.fields)
+        if isinstance(expr, ListComprehension):
+            return (
+                self._expr_uses_name_only_in_indices(expr.body, name, in_index)
+                and self._expr_uses_name_only_in_indices(expr.iterable, name, False)
+            )
+        if isinstance(expr, Call):
+            if expr.func == "ac_item2":
+                return (
+                    self._expr_uses_name_only_in_indices(expr.args[0], name, False)
+                    and all(self._expr_uses_name_only_in_indices(arg, name, True) for arg in expr.args[1:3])
+                )
+            if expr.func == "ac_set_item2":
+                return (
+                    self._expr_uses_name_only_in_indices(expr.args[0], name, False)
+                    and all(self._expr_uses_name_only_in_indices(arg, name, True) for arg in expr.args[1:3])
+                    and self._expr_uses_name_only_in_indices(expr.args[3], name, False)
+                )
+            if expr.func == "ac_item3":
+                return (
+                    self._expr_uses_name_only_in_indices(expr.args[0], name, False)
+                    and all(self._expr_uses_name_only_in_indices(arg, name, True) for arg in expr.args[1:4])
+                )
+            return all(self._expr_uses_name_only_in_indices(arg, name, in_index) for arg in expr.args)
+        if isinstance(expr, tuple):
+            return all(self._expr_uses_name_only_in_indices(item, name, in_index) for item in expr)
+        if isinstance(expr, list):
+            return all(self._expr_uses_name_only_in_indices(item, name, in_index) for item in expr)
+        return True
+
+    def _merge_adjacent_identical_ifs(self, body: list[object]) -> list[object]:
+        if len(body) < 2:
+            return body
+        merged: list[object] = []
+        index = 0
+        while index < len(body):
+            stmt = body[index]
+            if isinstance(stmt, If) and not stmt.orelse:
+                tests = [stmt.test]
+                next_index = index + 1
+                while next_index < len(body):
+                    candidate = body[next_index]
+                    if not (isinstance(candidate, If) and not candidate.orelse and candidate.body == stmt.body):
+                        break
+                    tests.append(candidate.test)
+                    next_index += 1
+                if len(tests) > 1:
+                    merged.append(
+                        If(
+                            test=BooleanOp("or", tuple(tests)),
+                            body=stmt.body,
+                            orelse=(),
+                        )
+                    )
+                    index = next_index
+                    continue
+            merged.append(stmt)
+            index += 1
+        return merged
 
     def _rewrite_full_array_init(self, body: list[object], index: int) -> tuple[object, int] | None:
         if index + 2 >= len(body):
@@ -922,6 +1626,7 @@ class FortranBackend:
                 "ac_normal_vec",
                 "ac_multivariate_normal",
                 "ac_loadtxt",
+                "ac_loadtxt_1d",
                 "ac_savetxt",
                 "ac_fill_slice",
             }:
@@ -1074,14 +1779,14 @@ class FortranBackend:
         return expr
 
     def _is_parameter_candidate(self, value_type: object, value_expr: object) -> bool:
-        if value_type in {ScalarType.INTEGER, ScalarType.REAL64, ScalarType.LOGICAL}:
+        if value_type in {ScalarType.INTEGER, ScalarType.REAL64, ScalarType.LOGICAL, ScalarType.STRING}:
             return self._is_scalar_parameter_expr(value_expr)
         if isinstance(value_type, ArrayTypeRef) and value_type.rank == 1:
             return self._is_array_parameter_expr(value_expr)
         return False
 
     def _is_scalar_parameter_expr(self, expr: object) -> bool:
-        if isinstance(expr, Constant) and isinstance(expr.value, (int, float, bool)):
+        if isinstance(expr, Constant) and isinstance(expr.value, (int, float, bool, str)):
             return True
         if isinstance(expr, UnaryOp) and expr.op in {UnaryOperator.PLUS, UnaryOperator.MINUS}:
             return self._is_scalar_parameter_expr(expr.operand)
@@ -1106,6 +1811,8 @@ class FortranBackend:
         intent_suffix = ", intent(in)"
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
+            if value_type.element_type == ScalarType.STRING:
+                return f"character(len=*){intent_suffix}", f"{name}{dims}"
             return f"{self._type_name(value_type.element_type)}{intent_suffix}", f"{name}{dims}"
         if value_type == ScalarType.STRING:
             return f"character(len=*){intent_suffix}", name
@@ -1114,29 +1821,70 @@ class FortranBackend:
     def _local_decl_parts(self, name: str, value_type: object) -> tuple[str, str]:
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
-            return f"{self._type_name(value_type)}, allocatable", f"{name}{dims}"
+            if value_type.element_type == ScalarType.STRING:
+                return "character(len=:), allocatable", f"{name}{dims}"
+            return f"{self._type_name(value_type.element_type)}, allocatable", f"{name}{dims}"
+        if value_type == ScalarType.STRING:
+            return "character(len=:), allocatable", name
         return self._type_name(value_type), name
 
     def _declare_result(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
+            if value_type.element_type == ScalarType.STRING:
+                return f"character(len=:), allocatable :: {name}{dims}"
             return f"{self._type_name(value_type.element_type)}, allocatable :: {name}{dims}"
+        if value_type == ScalarType.STRING:
+            return f"character(len=:), allocatable :: {name}"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _declare_component(self, name: str, value_type: object) -> str:
         if isinstance(value_type, ArrayTypeRef):
             dims = self._array_dims(value_type.rank)
+            if value_type.element_type == ScalarType.STRING:
+                return f"character(len=:), allocatable :: {name}{dims}"
             return f"{self._type_name(value_type.element_type)}, allocatable :: {name}{dims}"
+        if value_type == ScalarType.STRING:
+            return f"character(len=:), allocatable :: {name}"
         return f"{self._type_name(value_type)} :: {name}"
 
     def _emit_string(self, value: str) -> str:
-        escaped = value.replace('"', '""')
-        return f'"{escaped}"'
+        if not value:
+            return '""'
+        pieces: list[str] = []
+        current: list[str] = []
+        def flush() -> None:
+            if current:
+                pieces.append('"' + "".join(current).replace('"', '""') + '"')
+                current.clear()
+        for ch in value:
+            if ch == "\n":
+                flush()
+                pieces.append("new_line('a')")
+            elif ch == "\r":
+                flush()
+                pieces.append("achar(13)")
+            elif ch == "\t":
+                flush()
+                pieces.append("achar(9)")
+            else:
+                current.append(ch)
+        flush()
+        if not pieces:
+            return '""'
+        return " // ".join(pieces)
 
     def _emit_real(self, value: float) -> str:
+        if math.isclose(value, math.pi, rel_tol=0.0, abs_tol=1.0e-15):
+            return "ac_pi"
+        if math.isclose(value, math.e, rel_tol=0.0, abs_tol=1.0e-15):
+            return "ac_e"
         text = repr(value).lower()
         if "e" in text:
-            return text.replace("e", "d")
+            mantissa, exponent = text.split("e", 1)
+            if "." not in mantissa:
+                mantissa = mantissa + ".0"
+            return mantissa + "d" + exponent
         return f"{text}d0"
 
     def _type_name(self, value_type: object) -> str:
@@ -1149,7 +1897,7 @@ class FortranBackend:
             ScalarType.REAL64: "real(dp)",
             ScalarType.COMPLEX128: "complex(dp)",
             ScalarType.LOGICAL: "logical",
-            ScalarType.STRING: "character(len=:), allocatable",
+            ScalarType.STRING: "character(len=:)",
         }
         return mapping[value_type]
 
@@ -1159,6 +1907,17 @@ class FortranBackend:
     def _emit_array_literal(self, values: tuple[object, ...], target_name: str) -> str:
         if not values:
             return "[real(dp) :: ]"
+        if values and all(
+            isinstance(self._expr_type(value), ArrayTypeRef) and self._expr_type(value).rank == 1
+            for value in values
+        ):
+            first = self._emit_expr(values[0])
+            flat = "[" + ", ".join(self._emit_expr(value) for value in values) + "]"
+            return f"transpose(reshape({flat}, [size({first}), {len(values)}]))"
+        if all(isinstance(value, Constant) and isinstance(value.value, str) for value in values):
+            width = max(len(value.value) for value in values)
+            padded = [self._emit_string(value.value.ljust(width)) for value in values]
+            return "[" + ", ".join(padded) + "]"
         return "[" + ", ".join(self._emit_expr(value) for value in values) + "]"
 
     def _is_nested_array_literal(self, expr: object) -> bool:
@@ -1233,6 +1992,35 @@ class FortranBackend:
             return f"({text})"
         return text
 
+    def _emit_logical_operand(self, expr: object) -> str:
+        text = self._emit_expr(expr)
+        if isinstance(expr, (BooleanOp, ConditionalExpr)):
+            return f"({text})"
+        return text
+
+    def _emit_boolean_value(self, expr: object, parent_op: str) -> str:
+        text = self._emit_expr(expr)
+        if isinstance(expr, BooleanOp) and expr.op != parent_op:
+            return f"({text})"
+        if isinstance(expr, ConditionalExpr):
+            return f"({text})"
+        return text
+
+    def _emit_compare_operand(self, expr: object) -> str:
+        text = self._emit_expr(expr)
+        if isinstance(expr, (BooleanOp, ConditionalExpr, Compare)):
+            return f"({text})"
+        return text
+
+    def _emit_record_field_expr(self, expr: object, field_name: str, field_index: int) -> str:
+        if isinstance(expr, RecordLiteral):
+            for current_name, value in expr.fields:
+                if current_name == field_name:
+                    return self._emit_expr(value)
+        if isinstance(expr, Call) and expr.func == "ac_shape" and expr.args:
+            return f"ac_shape_dim({self._emit_expr(expr.args[0])}, {field_index})"
+        return self._emit_expr(FieldAccess(expr, field_name))
+
     def _emit_binary_operand(self, expr: object, parent_op: BinaryOperator, *, is_right: bool) -> str:
         text = self._emit_expr(expr)
         if self._needs_binary_parens(expr, parent_op, is_right=is_right):
@@ -1281,8 +2069,10 @@ class FortranBackend:
     def _binary_precedence(self, op: BinaryOperator) -> int:
         if op == BinaryOperator.POW:
             return 3
-        if op in {BinaryOperator.MUL, BinaryOperator.DIV}:
+        if op in {BinaryOperator.MUL, BinaryOperator.DIV, BinaryOperator.MOD}:
             return 2
+        if op in {BinaryOperator.AND, BinaryOperator.OR}:
+            return 0
         return 1
 
     def _trim_terminal_return(self, body: list[object], result_name: str) -> list[object]:
@@ -1315,12 +2105,49 @@ class FortranBackend:
             return [*body[:-1], Assignment(ValueRef(result_name), last.value)]
         return body
 
+    def _adopt_terminal_result_local(
+        self,
+        default_result_name: str,
+        local_values: list[tuple[str, object]],
+        body: list[object],
+    ) -> tuple[str, list[tuple[str, object]], list[object]]:
+        if self._count_name_writes(body, default_result_name) != 1:
+            return default_result_name, local_values, body
+        last_index = self._last_real_stmt_index(body)
+        if last_index is None:
+            return default_result_name, local_values, body
+        last_stmt = body[last_index]
+        if not (
+            isinstance(last_stmt, Assignment)
+            and isinstance(last_stmt.target, ValueRef)
+            and last_stmt.target.name == default_result_name
+            and isinstance(last_stmt.value, ValueRef)
+        ):
+            return default_result_name, local_values, body
+        adopted_name = last_stmt.value.name
+        local_names = {name for name, _ in local_values}
+        if adopted_name not in local_names:
+            return default_result_name, local_values, body
+        new_locals = [(name, value_type) for name, value_type in local_values if name != adopted_name]
+        new_body = [stmt for index, stmt in enumerate(body) if index != last_index]
+        return adopted_name, new_locals, new_body
+
+    def _last_real_stmt_index(self, body: list[object]) -> int | None:
+        for index in range(len(body) - 1, -1, -1):
+            if not isinstance(body[index], Comment):
+                return index
+        return None
+
     def _emit_one_line_if(self, test: object, stmt: object, result_name: str) -> str | None:
         if isinstance(stmt, Assignment):
             return f"if ({self._emit_expr(test)}) {stmt.target.name} = {self._emit_expr(stmt.value)}"
         if isinstance(stmt, AugmentedAssignment):
             value = self._emit_expr(stmt.value)
             return f"if ({self._emit_expr(test)}) {stmt.target.name} = {stmt.target.name} {stmt.op.value} {value}"
+        if isinstance(stmt, Continue):
+            return f"if ({self._emit_expr(test)}) cycle"
+        if isinstance(stmt, Break):
+            return f"if ({self._emit_expr(test)}) exit"
         if isinstance(stmt, ExprStatement) and isinstance(stmt.expr, Call):
             if stmt.expr.func in {"ac_fill_slice", "ac_set_slice"}:
                 direct_stmt = self._emit_direct_slice_assignment(stmt.expr)
@@ -1359,6 +2186,8 @@ class FortranBackend:
     def _is_elemental(self, fn: Function) -> bool:
         if fn.result_type is None:
             return False
+        if fn.result_type == ScalarType.STRING:
+            return False
         if isinstance(fn.result_type, (ArrayTypeRef, RecordTypeRef)):
             return False
         if any(isinstance(arg_type, (ArrayTypeRef, RecordTypeRef)) for _, arg_type in fn.args):
@@ -1374,6 +2203,11 @@ class FortranBackend:
         if cached is not None:
             return cached
         self._purity_cache[fn.name] = False
+        result_type = fn.result_type
+        if result_type == ScalarType.STRING:
+            return False
+        if isinstance(result_type, ArrayTypeRef) and result_type.element_type == ScalarType.STRING:
+            return False
         if self._assigned_argument_names(fn):
             return False
         if any(self._stmt_uses_impurity(stmt) for stmt in fn.body):
@@ -1481,7 +2315,26 @@ class FortranBackend:
 
     def _expr_uses_impurity(self, expr: object) -> bool:
         if isinstance(expr, Call):
-            if expr.func in {"ac_random_init", "ac_gauss", "ac_choice_weighted", "ac_choice_no_replace", "ac_loadtxt", "ac_savetxt", "ac_fill_slice"}:
+            if expr.func in {
+                "ac_random_init",
+                "ac_gauss",
+                "ac_wall_time",
+                "ac_choice_weighted",
+                "ac_choice_no_replace",
+                "ac_loadtxt",
+                "ac_loadtxt_1d",
+                "ac_savetxt",
+                "ac_fill_slice",
+                "ac_slogdet_sign",
+                "ac_slogdet_logabsdet",
+                "ac_inv",
+                "ac_cholesky",
+                "ac_format_default",
+                "ac_format_fixed",
+                "ac_format_scientific",
+                "ac_format_int",
+                "ac_format_array",
+            }:
                 return True
             if expr.func in self._functions_by_name and not self._is_pure(self._functions_by_name[expr.func]):
                 return True
@@ -1503,15 +2356,26 @@ class FortranBackend:
                 "ac_format_scientific",
                 "ac_format_int",
                 "ac_format_array",
+                "ac_parse_int",
+                "ac_parse_real",
                 "ac_set_printoptions",
             }:
                 helper_keys.add("ac_string")
             elif isinstance(value, Call) and value.func in {"ac_random_init", "ac_gauss"}:
                 helper_keys.add("ac_random")
-            elif isinstance(value, Call) and value.func in AC_NUMPY_FUNCS:
+            elif isinstance(value, Call) and (value.func == "ac_wall_time" or value.func in AC_NUMPY_FUNCS):
                 helper_keys.add("ac_numpy")
+            elif isinstance(value, Call) and value.func in AC_LAPACK_FUNCS:
+                helper_keys.add("ac_lapack")
             elif isinstance(value, RecordTypeRef) and value.name == "ac_random_state":
                 helper_keys.add("ac_random")
+            elif isinstance(value, Constant) and isinstance(value.value, float):
+                if math.isclose(value.value, math.pi, rel_tol=0.0, abs_tol=1.0e-15):
+                    helper_keys.add("ac_constants")
+                elif math.isclose(value.value, math.e, rel_tol=0.0, abs_tol=1.0e-15):
+                    helper_keys.add("ac_constants")
+            elif isinstance(value, Print):
+                helper_keys.add("ac_string")
 
             if isinstance(value, Module):
                 for record in value.records:
@@ -1576,14 +2440,14 @@ class FortranBackend:
             return f"ac_format_array({self._emit_expr(expr)})", True
         return self._emit_expr(expr), False
 
-    def _render_print_as_native_write(self, values: tuple[object, ...]) -> str | None:
+    def _render_print_as_native_write(self, values: tuple[object, ...], *, leading_blank: bool = False) -> str | None:
         parts: list[tuple[str, str]] = []
         for index, value in enumerate(values):
             if index > 0 and self._needs_print_separator(values[index - 1], value):
-                parts.append(("a", self._emit_string(" ")))
+                parts.append(("a", " "))
             literal = self._literal_string_value(value)
             if literal is not None:
-                parts.append(("a", self._emit_string(literal)))
+                parts.append(("a", literal))
                 continue
             expr_type = self._expr_type(value)
             if expr_type == ScalarType.INTEGER:
@@ -1598,7 +2462,7 @@ class FortranBackend:
         literal_buffer = ""
         for fmt, text in parts:
             if fmt == "a":
-                literal_buffer += self._unescape_fortran_string(text)
+                literal_buffer += text
                 continue
             if literal_buffer:
                 merged.append(("a", self._emit_string(literal_buffer)))
@@ -1607,7 +2471,10 @@ class FortranBackend:
         if literal_buffer:
             merged.append(("a", self._emit_string(literal_buffer)))
 
-        fmt = ", ".join(code for code, _ in merged)
+        fmt_codes = [code for code, _ in merged]
+        if leading_blank:
+            fmt_codes[0] = "/" if not fmt_codes else f"/,{fmt_codes[0]}"
+        fmt = ", ".join(fmt_codes)
         args = ", ".join(text for _, text in merged)
         return f'write(*, "({fmt})") {args}'
 
@@ -1634,6 +2501,9 @@ class FortranBackend:
         if isinstance(expr, IndexAccess):
             base_type = self._expr_type(expr.value)
             if isinstance(base_type, ArrayTypeRef):
+                index_type = self._expr_type(expr.index)
+                if isinstance(index_type, ArrayTypeRef):
+                    return ArrayTypeRef(base_type.element_type, rank=base_type.rank)
                 return base_type.element_type
         if isinstance(expr, UnaryOp):
             return self._expr_type(expr.operand)
@@ -1644,26 +2514,49 @@ class FortranBackend:
                 return left_type
             if isinstance(right_type, ArrayTypeRef):
                 return right_type
+            if expr.op == BinaryOperator.ADD and (left_type == ScalarType.STRING or right_type == ScalarType.STRING):
+                return ScalarType.STRING
             if left_type == ScalarType.INTEGER and right_type == ScalarType.INTEGER:
                 return ScalarType.INTEGER
             return ScalarType.REAL64
         if isinstance(expr, (Compare, BooleanOp)):
+            value_types: list[object] = []
+            if isinstance(expr, Compare):
+                value_types = [self._expr_type(expr.left), self._expr_type(expr.right)]
+            else:
+                value_types = [self._expr_type(value) for value in expr.values]
+            array_types = [typ for typ in value_types if isinstance(typ, ArrayTypeRef)]
+            if array_types:
+                return ArrayTypeRef(ScalarType.LOGICAL, rank=max(typ.rank for typ in array_types))
             return ScalarType.LOGICAL
         if isinstance(expr, Call):
             if expr.func in self._function_results:
                 return self._function_results[expr.func]
+            if expr.func == "ac_shape":
+                base_type = self._expr_type(expr.args[0]) if expr.args else None
+                if isinstance(base_type, ArrayTypeRef):
+                    return RecordTypeRef(f"ac_shape_{base_type.rank}d")
+                return RecordTypeRef("ac_shape_1d")
             if expr.func in {"ac_lower", "trim", "adjustl", "ac_format_default", "ac_format_fixed", "ac_format_scientific", "ac_format_int", "ac_format_array"}:
                 return ScalarType.STRING
-            if expr.func in {"size", "ac_ndim", "ac_shape_dim", "int"}:
+            if expr.func == "ac_wall_time":
+                return ScalarType.REAL64
+            if expr.func in {"size", "ac_ndim", "ac_shape_dim", "int", "ac_argmin", "ac_argmax", "ac_parse_int"}:
                 return ScalarType.INTEGER
-            if expr.func in {"ac_any"}:
+            if expr.func in {"ac_any", "ac_file_exists"}:
                 return ScalarType.LOGICAL
-            if expr.func in {"float", "ac_float", "abs", "min", "max", "sum", "sin", "cos", "sqrt", "exp", "log", "ac_norm"}:
+            if expr.func in {"float", "ac_float", "ac_parse_real", "abs", "min", "max", "minval", "maxval", "sum", "sin", "cos", "sqrt", "exp", "log", "ac_norm", "ac_var", "ac_std"}:
+                first_type = self._expr_type(expr.args[0]) if expr.args else None
+                if isinstance(first_type, ArrayTypeRef) and expr.func in {"abs", "sqrt", "exp", "log"}:
+                    return ArrayTypeRef(ScalarType.REAL64, rank=first_type.rank)
                 return ScalarType.REAL64
             if expr.func in {
                 "ac_array",
                 "ac_asarray",
+                "ac_astype_float",
+                "ac_astype_int",
                 "ac_reverse",
+                "ac_sign",
                 "ac_r_concat",
                 "ac_zeros",
                 "ac_arange",
@@ -1672,28 +2565,64 @@ class FortranBackend:
                 "ac_column_stack",
                 "ac_round",
                 "ac_slice",
+                "ac_slice_step",
+                "ac_slice2",
                 "ac_set_slice",
                 "ac_take_rows",
+                "ac_pick2",
                 "ac_row",
+                "ac_item3",
+                "ac_row_axis",
                 "ac_column",
                 "ac_add_axis",
-                "ac_copy",
                 "ac_full",
+                "ac_mean_axis",
+                "ac_min_axis",
                 "ac_where",
+                "ac_mask",
                 "ac_where_select",
+                "ac_argmin_axis",
+                "ac_argmax_axis",
                 "ac_argsort",
+                "ac_sort",
+                "ac_unique",
+                "ac_bincount",
+                "ac_searchsorted_left",
+                "ac_searchsorted_right",
                 "ac_roots",
                 "ac_normal_vec",
                 "ac_uniform_vec",
                 "ac_clip",
+                "ac_loadtxt_1d",
+                "ac_repeat",
+                "ac_repeat_axis",
+                "ac_tile",
+                "ac_diag",
+                "ac_diag_k",
+                "ac_triu",
+                "ac_tril",
+                "ac_cumsum",
+                "ac_cumprod",
+                "ac_diff",
+                "ac_gradient",
             }:
                 first_type = self._expr_type(expr.args[0]) if expr.args else None
                 if expr.func == "ac_row" and isinstance(first_type, ArrayTypeRef):
                     return ArrayTypeRef(first_type.element_type, max(1, first_type.rank - 1))
+                if expr.func == "ac_pick2" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func == "ac_item3" and isinstance(first_type, ArrayTypeRef):
+                    return first_type.element_type
+                if expr.func == "ac_astype_int" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.INTEGER, rank=first_type.rank)
+                if expr.func == "ac_astype_float" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.REAL64, rank=first_type.rank)
                 if expr.func == "ac_column" and isinstance(first_type, ArrayTypeRef):
                     return ArrayTypeRef(first_type.element_type, 1)
                 if expr.func == "ac_add_axis" and isinstance(first_type, ArrayTypeRef):
                     return ArrayTypeRef(first_type.element_type, first_type.rank + 1)
+                if expr.func == "ac_row_axis" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 2)
                 if expr.func == "ac_clip" and first_type == ScalarType.REAL64:
                     return ScalarType.REAL64
                 if expr.func == "ac_roots":
@@ -1702,26 +2631,80 @@ class FortranBackend:
                     second_type = self._expr_type(expr.args[1]) if len(expr.args) > 1 else None
                     if isinstance(second_type, ArrayTypeRef):
                         return second_type
-                    return ScalarType.REAL64
-                if expr.func in {"ac_where", "ac_argsort"}:
+                    return second_type or ScalarType.REAL64
+                if expr.func == "ac_reshape" and isinstance(first_type, ArrayTypeRef):
+                    if len(expr.args) == 2:
+                        return ArrayTypeRef(first_type.element_type, 1)
+                    if len(expr.args) in {3, 4}:
+                        return ArrayTypeRef(first_type.element_type, 2)
+                    if len(expr.args) == 5:
+                        return ArrayTypeRef(first_type.element_type, 3)
+                if expr.func in {"ac_where", "ac_argsort", "ac_bincount", "ac_searchsorted_left", "ac_searchsorted_right"}:
                     return ArrayTypeRef(ScalarType.INTEGER, 1)
+                if expr.func == "ac_sort" and isinstance(first_type, ArrayTypeRef):
+                    return first_type
+                if expr.func == "ac_unique" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func == "ac_repeat" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func == "ac_repeat_axis" and isinstance(first_type, ArrayTypeRef):
+                    return first_type
+                if expr.func == "ac_tile" and isinstance(first_type, ArrayTypeRef):
+                    return first_type
+                if expr.func == "ac_diag" and isinstance(first_type, ArrayTypeRef):
+                    if first_type.rank == 1:
+                        return ArrayTypeRef(first_type.element_type, 2)
+                    if first_type.rank == 2:
+                        return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func == "ac_diag_k" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 1)
+                if expr.func in {"ac_triu", "ac_tril"} and isinstance(first_type, ArrayTypeRef):
+                    return first_type
+                if expr.func == "ac_mask":
+                    if isinstance(first_type, ArrayTypeRef):
+                        return ArrayTypeRef(first_type.element_type, 1)
+                    return ArrayTypeRef(ScalarType.REAL64, 1)
+                if expr.func == "ac_slice2" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 2)
                 if expr.func == "ac_arange_int":
                     return ArrayTypeRef(ScalarType.INTEGER, 1)
                 if expr.func == "ac_column_stack":
                     return ArrayTypeRef(ScalarType.REAL64, 2)
+                if expr.func in {"ac_take", "ac_pad", "ac_roll"} and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, first_type.rank)
+                if expr.func in {"ac_concatenate_axis0", "ac_concatenate_axis1", "ac_hstack", "ac_vstack"} and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 2)
+                if expr.func in {"ac_stack_axis0", "ac_stack_axis2"} and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(first_type.element_type, 3)
+                if expr.func in {"ac_sum_axis", "ac_mean_axis", "ac_min_axis", "ac_max_axis"}:
+                    return ArrayTypeRef(ScalarType.REAL64, 1)
+                if expr.func in {"ac_argmin_axis", "ac_argmax_axis"}:
+                    return ArrayTypeRef(ScalarType.INTEGER, 1)
+                if expr.func == "ac_isnan" and isinstance(first_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.LOGICAL, first_type.rank)
                 if isinstance(first_type, ArrayTypeRef):
                     return first_type
+            if expr.func in {"ac_trace", "ac_nansum", "ac_nan"}:
+                return ScalarType.REAL64
+            if expr.func in {"ac_shuffle", "ac_put"}:
+                return ScalarType.NONE
+            if expr.func in {"ac_random_integers", "ac_choice_replace"}:
+                return ArrayTypeRef(ScalarType.INTEGER, 1)
             if expr.func in {
                 "ac_empty",
                 "ac_empty2",
                 "ac_zeros2",
                 "ac_matmul",
                 "ac_transpose",
+                "ac_transpose_perm",
+                "ac_swapaxes",
                 "ac_atleast_2d",
                 "ac_inv",
+                "ac_cholesky",
                 "ac_cov_rowvar_false",
                 "ac_multivariate_normal",
                 "ac_loadtxt",
+                "ac_loadtxt_1d",
                 "ac_set_rows",
                 "ac_set_row",
                 "ac_set_column",
@@ -1729,20 +2712,59 @@ class FortranBackend:
                 "ac_mul_col",
                 "ac_solve_linear",
                 "ac_solve_linear_fallback",
+                "ac_outer",
+                "ac_kron",
+                "ac_concatenate_axis0",
+                "ac_concatenate_axis1",
+                "ac_hstack",
+                "ac_vstack",
+                "ac_stack_axis0",
+                "ac_stack_axis2",
+                "ac_floor",
+                "ac_ceil",
+                "ac_slice2",
             }:
                 if expr.func in {
                     "ac_empty2",
                     "ac_zeros2",
-                    "ac_matmul",
                     "ac_transpose",
+                    "ac_transpose_perm",
+                    "ac_swapaxes",
                     "ac_atleast_2d",
                     "ac_inv",
+                    "ac_cholesky",
                     "ac_cov_rowvar_false",
                     "ac_loadtxt",
                     "ac_sub_col",
                     "ac_mul_col",
+                    "ac_outer",
+                    "ac_kron",
+                    "ac_concatenate_axis0",
+                    "ac_concatenate_axis1",
+                    "ac_hstack",
+                    "ac_vstack",
+                    "ac_slice2",
                 }:
                     return ArrayTypeRef(ScalarType.REAL64, 2)
+                if expr.func == "ac_matmul":
+                    left_type = self._expr_type(expr.args[0]) if expr.args else None
+                    right_type = self._expr_type(expr.args[1]) if len(expr.args) > 1 else None
+                    if isinstance(left_type, ArrayTypeRef) and isinstance(right_type, ArrayTypeRef):
+                        if left_type.rank == 1 and right_type.rank == 1:
+                            return ScalarType.REAL64
+                        if (left_type.rank == 1 and right_type.rank == 2) or (left_type.rank == 2 and right_type.rank == 1):
+                            return ArrayTypeRef(ScalarType.REAL64, 1)
+                        if left_type.rank == 2 and right_type.rank == 2:
+                            return ArrayTypeRef(ScalarType.REAL64, 2)
+                    if isinstance(left_type, ArrayTypeRef) and left_type.rank == 2 and isinstance(right_type, ArrayTypeRef) and right_type.rank == 1:
+                        return ArrayTypeRef(ScalarType.REAL64, 1)
+                    return ArrayTypeRef(ScalarType.REAL64, 2)
+                if expr.func == "ac_loadtxt_1d":
+                    return ArrayTypeRef(ScalarType.REAL64, 1)
+                if expr.func in {"ac_stack_axis0", "ac_stack_axis2"}:
+                    return ArrayTypeRef(ScalarType.REAL64, 3)
+                if expr.func in {"ac_floor", "ac_ceil"}:
+                    return ArrayTypeRef(ScalarType.REAL64, 1)
                 if expr.func in {"ac_empty", "ac_multivariate_normal", "ac_solve_linear", "ac_solve_linear_fallback"}:
                     return ArrayTypeRef(ScalarType.REAL64, 1)
         return None
@@ -1755,15 +2777,15 @@ class FortranBackend:
         parts: list[tuple[str, bool]] = []
         for index, ((text, _), original) in enumerate(zip(rendered, original_values, strict=True)):
             if index > 0 and self._needs_print_separator(original_values[index - 1], original):
-                parts.append((self._emit_string(" "), True))
+                parts.append((" ", True))
             literal = self._literal_string_value(original)
-            parts.append((self._emit_string(literal), True) if literal is not None else (text, False))
+            parts.append((literal, True) if literal is not None else (text, False))
 
         combined: list[tuple[str, bool]] = []
         literal_buffer = ""
         for text, is_literal in parts:
             if is_literal:
-                literal_buffer += self._unescape_fortran_string(text)
+                literal_buffer += text
                 continue
             if literal_buffer:
                 combined.append((self._emit_string(literal_buffer), True))

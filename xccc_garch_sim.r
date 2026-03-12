@@ -1,64 +1,111 @@
 timing_enabled <- TRUE
 
-# xgarch_sim.r
-# simulate returns from a garch(1,1) model using base r only
-# write the simulated returns to a file
-# print:
-#   1) acf of squared returns
-#   2) moments of returns
-#   3) direct estimates of garch(1,1) parameters with no optimizer
-#   4) normality tests for returns and standardized residuals
-#   5) elapsed times by section if timing is enabled
-#
-# model:
-#   r_t = mu + eps_t
-#   eps_t = sqrt(sigma2_t) * z_t,   z_t ~ n(0,1)
-#   sigma2_t = omega + alpha * eps_{t-1}^2 + beta * sigma2_{t-1}
-#
-# command line arguments:
-#   1: n
-#   2: outfile
-#   3: omega
-#   4: alpha
-#   5: beta
-#   6: mu
-#   7: seed
+n <- 2000L
+outfile <- "ccc_garch_returns.txt"
+seed <- NULL
+burn_in <- 1000L
 
-simulate_garch11 <- function(n, omega, alpha, beta, mu = 0, seed = NULL) {
+mc_corr_n <- 50000L
+mc_corr_burn <- 5000L
+
+omega_true <- c(0.010, 0.015, 0.020)
+alpha_true <- c(0.080, 0.100, 0.070)
+beta_true <- c(0.900, 0.850, 0.880)
+mu_true <- c(0.000, 0.000, 0.000)
+
+R_true <- matrix(
+  c(
+    1.00, 0.45, 0.25,
+    0.45, 1.00, 0.35,
+    0.25, 0.35, 1.00
+  ),
+  nrow = 3,
+  byrow = TRUE
+)
+
+make_spd_corr <- function(R, eps = 1e-8) {
+  R <- 0.5 * (R + t(R))
+  eig <- eigen(R, symmetric = TRUE)
+  vals <- pmax(eig$values, eps)
+  X <- eig$vectors %*% diag(vals, nrow = length(vals)) %*% t(eig$vectors)
+  d <- sqrt(diag(X))
+  X <- diag(1 / d, nrow = length(d)) %*% X %*% diag(1 / d, nrow = length(d))
+  X <- 0.5 * (X + t(X))
+  diag(X) <- 1
+  X
+}
+
+validate_ccc_inputs <- function(omega, alpha, beta, mu, R) {
+  p <- length(omega)
+
+  if (length(alpha) != p || length(beta) != p || length(mu) != p) {
+    stop("omega, alpha, beta, and mu must have the same length")
+  }
+  if (!is.matrix(R) || nrow(R) != p || ncol(R) != p) {
+    stop("R_true must be a square matrix with dimension length(omega_true)")
+  }
+  if (any(omega <= 0)) {
+    stop("all omega values must be > 0")
+  }
+  if (any(alpha < 0) || any(beta < 0)) {
+    stop("all alpha and beta values must be >= 0")
+  }
+  if (any(alpha + beta >= 1)) {
+    stop("need alpha + beta < 1 for each asset")
+  }
+}
+
+simulate_ccc_garch <- function(n, omega, alpha, beta, mu, R, seed = NULL, burn_in = 0L) {
   if (!is.null(seed)) {
     set.seed(seed)
   }
 
-  if (n < 11) {
-    stop("n must be at least 11")
-  }
-  if (omega <= 0) {
-    stop("omega must be > 0")
-  }
-  if (alpha < 0 || beta < 0) {
-    stop("alpha and beta must be >= 0")
-  }
-  if (alpha + beta >= 1) {
-    stop("need alpha + beta < 1 for a stationary simulation")
+  validate_ccc_inputs(omega, alpha, beta, mu, R)
+
+  p <- length(omega)
+  R <- make_spd_corr(R)
+  total_n <- n + burn_in
+
+  asset_names <- if (!is.null(names(omega))) {
+    names(omega)
+  } else {
+    paste0("asset", seq_len(p))
   }
 
-  ret <- numeric(n)
-  eps <- numeric(n)
-  sigma2 <- numeric(n)
+  z0 <- matrix(rnorm(total_n * p), nrow = total_n, ncol = p)
+  C <- chol(R)
+  z <- z0 %*% C
 
-  sigma2[1] <- omega / (1 - alpha - beta)
-  eps[1] <- sqrt(sigma2[1]) * rnorm(1)
-  ret[1] <- mu + eps[1]
+  sigma2 <- matrix(0, nrow = total_n, ncol = p)
+  eps <- matrix(0, nrow = total_n, ncol = p)
+  ret <- matrix(0, nrow = total_n, ncol = p)
 
-  if (n >= 2) {
-    for (i in 2:n) {
-      sigma2[i] <- omega + alpha * eps[i - 1]^2 + beta * sigma2[i - 1]
-      eps[i] <- sqrt(sigma2[i]) * rnorm(1)
-      ret[i] <- mu + eps[i]
+  sigma2[1, ] <- omega / (1 - alpha - beta)
+  eps[1, ] <- sqrt(sigma2[1, ]) * z[1, ]
+  ret[1, ] <- mu + eps[1, ]
+
+  if (total_n >= 2) {
+    for (t in 2:total_n) {
+      sigma2[t, ] <- omega + alpha * eps[t - 1, ]^2 + beta * sigma2[t - 1, ]
+      eps[t, ] <- sqrt(sigma2[t, ]) * z[t, ]
+      ret[t, ] <- mu + eps[t, ]
     }
   }
 
-  list(ret = ret, eps = eps, sigma2 = sigma2)
+  if (burn_in > 0) {
+    keep <- (burn_in + 1):total_n
+    sigma2 <- sigma2[keep, , drop = FALSE]
+    eps <- eps[keep, , drop = FALSE]
+    ret <- ret[keep, , drop = FALSE]
+    z <- z[keep, , drop = FALSE]
+  }
+
+  colnames(sigma2) <- asset_names
+  colnames(eps) <- asset_names
+  colnames(ret) <- asset_names
+  colnames(z) <- asset_names
+
+  list(ret = ret, eps = eps, sigma2 = sigma2, z = z)
 }
 
 acf_lags <- function(x, lag_max) {
@@ -332,6 +379,51 @@ fit_garch11_direct <- function(ret) {
   )
 }
 
+fit_ccc_garch_direct <- function(ret_mat) {
+  p <- ncol(ret_mat)
+  n <- nrow(ret_mat)
+
+  fits <- vector("list", p)
+  mu_fit <- numeric(p)
+  omega_fit <- numeric(p)
+  alpha_fit <- numeric(p)
+  beta_fit <- numeric(p)
+  sd_uncond_fit <- numeric(p)
+  z_fit <- matrix(NA_real_, nrow = n, ncol = p)
+
+  for (i in seq_len(p)) {
+    fits[[i]] <- fit_garch11_direct(ret_mat[, i])
+    mu_fit[i] <- fits[[i]]$mu
+    omega_fit[i] <- fits[[i]]$omega
+    alpha_fit[i] <- fits[[i]]$alpha
+    beta_fit[i] <- fits[[i]]$beta
+    sd_uncond_fit[i] <- fits[[i]]$sd_uncond
+    z_fit[, i] <- fits[[i]]$residuals
+  }
+
+  colnames(z_fit) <- colnames(ret_mat)
+  R_fit <- cor(z_fit)
+  R_fit <- make_spd_corr(R_fit)
+  dimnames(R_fit) <- list(colnames(ret_mat), colnames(ret_mat))
+
+  names(mu_fit) <- colnames(ret_mat)
+  names(omega_fit) <- colnames(ret_mat)
+  names(alpha_fit) <- colnames(ret_mat)
+  names(beta_fit) <- colnames(ret_mat)
+  names(sd_uncond_fit) <- colnames(ret_mat)
+
+  list(
+    fits = fits,
+    mu_fit = mu_fit,
+    omega_fit = omega_fit,
+    alpha_fit = alpha_fit,
+    beta_fit = beta_fit,
+    sd_uncond_fit = sd_uncond_fit,
+    z_fit = z_fit,
+    R_fit = R_fit
+  )
+}
+
 jarque_bera_test <- function(x) {
   x <- x[is.finite(x)]
   n <- length(x)
@@ -405,6 +497,17 @@ fmt_num <- function(x, width = 12, digits = 6) {
   out
 }
 
+print_matrix_block <- function(title, mat) {
+  cat(title, "\n", sep = "")
+  cn <- colnames(mat)
+  rn <- rownames(mat)
+  cat(sprintf("%12s", ""), paste(sprintf("%12s", cn), collapse = ""), "\n", sep = "")
+  for (i in seq_len(nrow(mat))) {
+    cat(sprintf("%12s", rn[i]), paste(fmt_num(mat[i, ]), collapse = ""), "\n", sep = "")
+  }
+  cat("\n")
+}
+
 timer_new <- function(enabled = TRUE) {
   list(enabled = enabled, elapsed = numeric(0))
 }
@@ -432,90 +535,50 @@ timer_print <- function(timer) {
   cat(sprintf("%20s %12.6f\n", "total", sum(vals)))
 }
 
-main <- function() {
-  args <- commandArgs(trailingOnly = TRUE)
-
-  n <- if (length(args) >= 1) as.integer(args[1]) else 100000L
-  outfile <- if (length(args) >= 2) args[2] else "garch_returns.txt"
-  omega <- if (length(args) >= 3) as.numeric(args[3]) else 0.01
-  alpha <- if (length(args) >= 4) as.numeric(args[4]) else 0.08
-  beta <- if (length(args) >= 5) as.numeric(args[5]) else 0.90
-  mu <- if (length(args) >= 6) as.numeric(args[6]) else 0
-  seed <- if (length(args) >= 7) as.integer(args[7]) else NULL
-
-  timer <- timer_new(timing_enabled)
-
-  t0 <- proc.time()[["elapsed"]]
-  sim <- simulate_garch11(
-    n = n,
-    omega = omega,
-    alpha = alpha,
-    beta = beta,
-    mu = mu,
-    seed = seed
-  )
-  t1 <- proc.time()[["elapsed"]]
-  timer <- timer_add(timer, "simulate", t1 - t0)
-
-  t0 <- proc.time()[["elapsed"]]
-  write.table(
-    data.frame(ret = sim$ret),
-    file = outfile,
-    row.names = FALSE,
-    col.names = TRUE,
-    quote = FALSE
-  )
-  t1 <- proc.time()[["elapsed"]]
-  timer <- timer_add(timer, "write_file", t1 - t0)
-
-  t0 <- proc.time()[["elapsed"]]
-  est <- fit_garch11_direct(sim$ret)
-  t1 <- proc.time()[["elapsed"]]
-  timer <- timer_add(timer, "estimate", t1 - t0)
-
-  t0 <- proc.time()[["elapsed"]]
-  sq_acf_sim <- acf_lags(sim$ret^2, 10)
+asset_report <- function(asset_name, ret, fit, omega_true_i, alpha_true_i, beta_true_i, mu_true_i) {
+  sq_acf_sim <- acf_lags(ret^2, 10)
   sq_acf_fit <- garch11_theoretical_sq_acf(
-    est$omega, est$alpha, est$beta, est$mu, 10
+    fit$omega, fit$alpha, fit$beta, fit$mu, 10
   )
   sq_acf_true <- garch11_theoretical_sq_acf(
-    omega, alpha, beta, mu, 10
+    omega_true_i, alpha_true_i, beta_true_i, mu_true_i, 10
   )
   sq_acf_sim_true <- sq_acf_sim - sq_acf_true
   sq_acf_fit_true <- sq_acf_fit - sq_acf_true
 
-  stats_sim <- summary_stats(sim$ret)
+  stats_sim <- summary_stats(ret)
   stats_fit <- garch11_theoretical_stats(
-    est$omega, est$alpha, est$beta, est$mu
+    fit$omega, fit$alpha, fit$beta, fit$mu
   )
   stats_true <- garch11_theoretical_stats(
-    omega, alpha, beta, mu
+    omega_true_i, alpha_true_i, beta_true_i, mu_true_i
   )
   stats_sim_true <- stats_sim - stats_true
   stats_fit_true <- stats_fit - stats_true
 
   param_fit <- c(
-    mu = est$mu,
-    omega = est$omega,
-    alpha = est$alpha,
-    beta = est$beta,
-    sd_uncond = est$sd_uncond
+    mu = fit$mu,
+    omega = fit$omega,
+    alpha = fit$alpha,
+    beta = fit$beta,
+    sd_uncond = fit$sd_uncond
   )
   param_true <- c(
-    mu = mu,
-    omega = omega,
-    alpha = alpha,
-    beta = beta,
-    sd_uncond = garch11_uncond_sd(omega, alpha, beta)
+    mu = mu_true_i,
+    omega = omega_true_i,
+    alpha = alpha_true_i,
+    beta = beta_true_i,
+    sd_uncond = garch11_uncond_sd(omega_true_i, alpha_true_i, beta_true_i)
   )
   param_fit_true <- param_fit - param_true
 
-  normal_ret <- normality_summary(sim$ret)
-  normal_res <- normality_summary(est$residuals)
-  t1 <- proc.time()[["elapsed"]]
-  timer <- timer_add(timer, "diagnostics", t1 - t0)
+  normal_ret <- normality_summary(ret)
+  normal_res <- normality_summary(fit$residuals)
 
-  t0 <- proc.time()[["elapsed"]]
+  cat("============================================================\n")
+  cat(asset_name, "\n")
+  cat("============================================================\n")
+
   cat("acf of squared returns\n")
   acf_labels <- c("", as.character(1:10))
   cat(paste(sprintf("%12s", acf_labels), collapse = ""), "\n", sep = "")
@@ -574,7 +637,7 @@ main <- function() {
 
   norm_labels <- c("", "jb_stat", "jb_p", "sw_w", "sw_p", "skew", "ex_kurt")
   cat("normality tests\n")
-  cat("(residuals are standardized residuals from the direct garch estimate)\n")
+  cat("(residuals are standardized residuals from the direct garch fit)\n")
   cat(paste(sprintf("%12s", norm_labels), collapse = ""), "\n", sep = "")
   cat(sprintf("%12s", "returns"),
       paste(fmt_num(normal_ret), collapse = ""),
@@ -584,32 +647,155 @@ main <- function() {
       "\n", sep = "")
 
   cat("\n")
-  cat("direct estimator details\n")
+
   detail_labels <- c("", "rho1_sq", "phi", "alpha_kurt", "alpha_rho1")
   detail_vals <- c(
-    est$rho1_hat,
-    est$phi_hat,
-    est$alpha_kurt,
-    est$alpha_rho1
+    fit$rho1_hat,
+    fit$phi_hat,
+    fit$alpha_kurt,
+    fit$alpha_rho1
   )
+  cat("direct estimator details\n")
   cat(paste(sprintf("%12s", detail_labels), collapse = ""), "\n", sep = "")
   cat(sprintf("%12s", "estimate"),
       paste(fmt_num(detail_vals), collapse = ""),
       "\n", sep = "")
 
   cat("\n")
-  cat("wrote", n, "returns to", outfile, "\n")
-  cat("omega =", omega, "alpha =", alpha, "beta =", beta,
-      "mu =", mu, "seed =", seed, "\n")
+}
 
-  if (is.na(stats_true["ex_kurt"]) || any(is.na(sq_acf_true))) {
-    cat("note: true ex_kurt and true squared-return acf require a finite fourth moment\n")
-    cat("      condition: 3*alpha^2 + 2*alpha*beta + beta^2 < 1\n")
+main <- function() {
+  validate_ccc_inputs(omega_true, alpha_true, beta_true, mu_true, R_true)
+
+  p <- length(omega_true)
+  asset_names <- if (!is.null(names(omega_true))) {
+    names(omega_true)
+  } else {
+    paste0("asset", seq_len(p))
   }
+
+  names(omega_true) <<- asset_names
+  names(alpha_true) <<- asset_names
+  names(beta_true) <<- asset_names
+  names(mu_true) <<- asset_names
+  dimnames(R_true) <<- list(asset_names, asset_names)
+
+  timer <- timer_new(timing_enabled)
+
+  t0 <- proc.time()[["elapsed"]]
+  sim <- simulate_ccc_garch(
+    n = n,
+    omega = omega_true,
+    alpha = alpha_true,
+    beta = beta_true,
+    mu = mu_true,
+    R = R_true,
+    seed = seed,
+    burn_in = burn_in
+  )
   t1 <- proc.time()[["elapsed"]]
-  timer <- timer_add(timer, "print_main_output", t1 - t0)
+  timer <- timer_add(timer, "simulate", t1 - t0)
+
+  t0 <- proc.time()[["elapsed"]]
+  write.table(
+    data.frame(sim$ret),
+    file = outfile,
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = FALSE
+  )
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "write_file", t1 - t0)
+
+  t0 <- proc.time()[["elapsed"]]
+  fit <- fit_ccc_garch_direct(sim$ret)
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "fit_univariate_ccc", t1 - t0)
+
+  t0 <- proc.time()[["elapsed"]]
+  corr_ret_emp <- cor(sim$ret)
+  corr_z_emp <- cor(sim$z)
+  corr_z_fit <- fit$R_fit
+  corr_z_true <- R_true
+
+  sim_fit_mc <- simulate_ccc_garch(
+    n = mc_corr_n,
+    omega = fit$omega_fit,
+    alpha = fit$alpha_fit,
+    beta = fit$beta_fit,
+    mu = fit$mu_fit,
+    R = fit$R_fit,
+    seed = if (is.null(seed)) NULL else seed + 1000L,
+    burn_in = mc_corr_burn
+  )
+  corr_ret_fit <- cor(sim_fit_mc$ret)
+
+  sim_true_mc <- simulate_ccc_garch(
+    n = mc_corr_n,
+    omega = omega_true,
+    alpha = alpha_true,
+    beta = beta_true,
+    mu = mu_true,
+    R = R_true,
+    seed = if (is.null(seed)) NULL else seed + 2000L,
+    burn_in = mc_corr_burn
+  )
+  corr_ret_true <- cor(sim_true_mc$ret)
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "correlation_matrices", t1 - t0)
+
+  t0 <- proc.time()[["elapsed"]]
+  for (i in seq_len(p)) {
+    asset_report(
+      asset_name = asset_names[i],
+      ret = sim$ret[, i],
+      fit = fit$fits[[i]],
+      omega_true_i = omega_true[i],
+      alpha_true_i = alpha_true[i],
+      beta_true_i = beta_true[i],
+      mu_true_i = mu_true[i]
+    )
+  }
+
+  cat("============================================================\n")
+  cat("correlation matrix of returns\n")
+  cat("empirical = sample correlation of simulated returns\n")
+  cat("fit = monte carlo approximation under fitted ccc-garch model\n")
+  cat("true = monte carlo approximation under true ccc-garch model\n")
+  cat("============================================================\n\n")
+
+  print_matrix_block("empirical", corr_ret_emp)
+  print_matrix_block("fit", corr_ret_fit)
+  print_matrix_block("true", corr_ret_true)
+
+  cat("============================================================\n")
+  cat("correlation matrix of standardized residuals\n")
+  cat("empirical = sample correlation of true simulated shocks z_t\n")
+  cat("fit = sample correlation of fitted standardized residuals\n")
+  cat("true = input ccc correlation matrix\n")
+  cat("============================================================\n\n")
+
+  print_matrix_block("empirical", corr_z_emp)
+  print_matrix_block("fit", corr_z_fit)
+  print_matrix_block("true", corr_z_true)
+
+  cat("wrote", n, "rows of", p, "-asset returns to", outfile, "\n")
+  cat("burn_in =", burn_in, "\n")
+  cat("mc_corr_n =", mc_corr_n, "mc_corr_burn =", mc_corr_burn, "\n")
+
+  exk_true <- mapply(
+    function(o, a, b, m) garch11_theoretical_stats(o, a, b, m)["ex_kurt"],
+    omega_true, alpha_true, beta_true, mu_true
+  )
+
+  if (any(is.na(exk_true))) {
+    cat("note: some true excess kurtosis values are na because the fourth moment is not finite\n")
+  }
 
   cat("\n")
+  t1 <- proc.time()[["elapsed"]]
+  timer <- timer_add(timer, "print_output", t1 - t0)
+
   timer_print(timer)
 }
 

@@ -3,7 +3,7 @@ use kind_mod, only: dp
 implicit none
 private
 public :: ac_lower, ac_format_default, ac_format_fixed, ac_format_scientific, &
-    & ac_format_int, ac_format_array, ac_set_printoptions
+    & ac_format_int, ac_format_array, ac_parse_int, ac_parse_real, ac_set_printoptions
 
 interface ac_format_default
     module procedure ac_format_default_real
@@ -13,6 +13,7 @@ end interface ac_format_default
 
 interface ac_format_array
     module procedure ac_format_array_1d_real
+    module procedure ac_format_array_1d_int
 end interface ac_format_array
 
 integer :: ac_print_precision = 6
@@ -161,6 +162,39 @@ do i = 1, size(values)
 end do
 out = out // "]"
 end function ac_format_array_1d_real
+
+function ac_format_array_1d_int(values) result(out)
+integer, intent(in) :: values(:)
+character(len=:), allocatable :: out
+character(len=:), allocatable :: piece
+integer :: i
+
+out = "["
+do i = 1, size(values)
+    piece = ac_format_default_int(values(i))
+    if (i > 1) out = out // " "
+    out = out // piece
+end do
+out = out // "]"
+end function ac_format_array_1d_int
+
+pure function ac_parse_int(value) result(out)
+character(len=*), intent(in) :: value
+integer :: out
+integer :: ios
+
+read(value, *, iostat=ios) out
+if (ios /= 0) error stop "ac_parse_int: invalid integer"
+end function ac_parse_int
+
+pure function ac_parse_real(value) result(out)
+character(len=*), intent(in) :: value
+real(dp) :: out
+integer :: ios
+
+read(value, *, iostat=ios) out
+if (ios /= 0) error stop "ac_parse_real: invalid real"
+end function ac_parse_real
 
 pure function ac_normalize_decimal_string(value) result(out)
 character(len=*), intent(in) :: value

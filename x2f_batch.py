@@ -42,13 +42,14 @@ def expand_inputs(items: list[str]) -> list[Path]:
         for match in matches:
             path = Path(match)
             if path.is_dir():
-                for file_path in sorted(path.glob("*.py")):
-                    key = str(file_path.resolve()).lower()
-                    if key not in seen:
-                        seen.add(key)
-                        out.append(file_path)
+                for pattern in ("*.py", "*.r", "*.R"):
+                    for file_path in sorted(path.glob(pattern)):
+                        key = str(file_path.resolve()).lower()
+                        if key not in seen:
+                            seen.add(key)
+                            out.append(file_path)
                 continue
-            if path.suffix.lower() != ".py" or not path.exists():
+            if path.suffix.lower() not in {".py", ".r"} or not path.exists():
                 continue
             key = str(path.resolve()).lower()
             if key not in seen:
@@ -154,8 +155,8 @@ def write_csv(path: Path, results: list[CaseResult]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run x2f.py over many Python files.")
-    parser.add_argument("inputs", nargs="+", help="Python files, directories, or glob patterns")
+    parser = argparse.ArgumentParser(description="Run x2f.py over many source files.")
+    parser.add_argument("inputs", nargs="+", help="Source files, directories, or glob patterns")
     parser.add_argument("--compile", action="store_true", help="Pass --compile to x2f.py")
     parser.add_argument("--run", action="store_true", help="Pass --run to x2f.py")
     parser.add_argument("--run-both", action="store_true", help="Pass --run-both to x2f.py")
@@ -175,7 +176,7 @@ def main() -> int:
 
     py_files = expand_inputs(args.inputs)
     if not py_files:
-        print("No Python files matched the provided inputs.")
+        print("No source files matched the provided inputs.")
         return 1
     if args.limit > 0:
         py_files = py_files[: args.limit]
