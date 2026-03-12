@@ -24,27 +24,39 @@ echo Clearing current staged set...
 git reset >nul
 if errorlevel 1 exit /b 1
 
-echo Staging core source directories...
-call :stage_path ".gitignore"
-call :stage_path "README.md"
-call :stage_path "pyproject.toml"
-call :stage_path "corpus.toml"
-call :stage_path "fortran_style.txt"
-call :stage_path "runall.bat"
-call :stage_path "x2f.py"
-call :stage_path "x2f_batch.py"
-call :stage_path "x2p.py"
-call :stage_path "x2p_batch.py"
-call :stage_path "xpyannotate.py"
-call :stage_path "xpycheck.py"
-call :stage_path "xrcheck.py"
-call :stage_path "upload_to_github.bat"
-call :stage_path "array_compiler"
-call :stage_path "scripts"
+echo Staging curated project files...
+for %%F in (
+    ".gitignore"
+    "README.md"
+    "pyproject.toml"
+    "corpus.toml"
+    "fortran_style.txt"
+    "runall.bat"
+    "x2f.py"
+    "x2f_batch.py"
+    "x2p.py"
+    "x2p_batch.py"
+    "xpyannotate.py"
+    "xpycheck.py"
+    "xrcheck.py"
+    "upload_to_github.bat"
+) do (
+    if exist %%~F git add -- %%~F
+    if errorlevel 1 exit /b 1
+)
 
-echo Staging root source files...
-for %%F in (*.py *.r *.R *.f90 *.bat) do (
-    if exist "%%~fF" call :maybe_stage_root "%%~nxF"
+if exist "array_compiler" git add -- "array_compiler"
+if errorlevel 1 exit /b 1
+
+if exist "scripts" git add -- "scripts"
+if errorlevel 1 exit /b 1
+
+if exist "tests" git add -- "tests"
+if errorlevel 1 exit /b 1
+
+echo Staging top-level source files with project prefixes...
+for %%F in (x*.py x*.r x*.R x*.f90 x*.bat) do (
+    if exist "%%~fF" call :maybe_stage "%%~nxF"
 )
 
 echo Staged files:
@@ -52,7 +64,7 @@ git diff --cached --name-only
 
 git diff --cached --quiet
 if not errorlevel 1 (
-    echo no project source changes staged
+    echo no curated project changes staged
     exit /b 0
 )
 
@@ -63,31 +75,21 @@ if errorlevel 1 exit /b 1
 
 echo Pushing to %REMOTE%...
 git push %REMOTE% HEAD
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+    echo Push failed because the remote branch is ahead of this checkout.
+    echo Suggested next steps:
+    echo   git fetch %REMOTE%
+    echo   git rebase %REMOTE%/main
+    echo   git push %REMOTE% HEAD
+    exit /b 1
+)
 
 echo Upload complete.
 exit /b 0
 
-:stage_path
-if exist "%~1" (
-    git add -- "%~1"
-    if errorlevel 1 exit /b 1
-)
-exit /b 0
-
-:maybe_stage_root
+:maybe_stage
 set "FILE=%~1"
 set "SKIP="
-
-if /I "!FILE!"=="runall.bat" set "SKIP=1"
-if /I "!FILE!"=="upload_to_github.bat" set "SKIP=1"
-if /I "!FILE!"=="x2f.py" set "SKIP=1"
-if /I "!FILE!"=="x2f_batch.py" set "SKIP=1"
-if /I "!FILE!"=="x2p.py" set "SKIP=1"
-if /I "!FILE!"=="x2p_batch.py" set "SKIP=1"
-if /I "!FILE!"=="xpyannotate.py" set "SKIP=1"
-if /I "!FILE!"=="xpycheck.py" set "SKIP=1"
-if /I "!FILE!"=="xrcheck.py" set "SKIP=1"
 
 echo(!FILE!| findstr /R /I "_p\.py$ _p\.f90$ _annotated\.py$ \.warnings\.txt$ ^temp ^tmp ^_tmp ^commit.*\.bat$ \.exe$ \.obj$ \.o$ \.mod$" >nul
 if not errorlevel 1 set "SKIP=1"

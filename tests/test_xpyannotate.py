@@ -28,8 +28,8 @@ def test_python_annotator_adds_final_and_array_annotations() -> None:
     assert "from array_compiler.annotations import Array1D, Array2D, Array3D" in annotated
     assert "n: Final[int] = 5" in annotated
     assert "sigma: Final[float] = 1.0" in annotated
-    assert "x: Final[Array1D[float]] = np.arange(10)" in annotated
-    assert "a: Final[Array2D[float]] = np.zeros((2, 3))" in annotated
+    assert "x: Final[Array1D[float]] = np.arange(10)  # xpyannotate: readonly-array" in annotated
+    assert "a: Final[Array2D[float]] = np.zeros((2, 3))  # xpyannotate: readonly-array" in annotated
     assert warnings == []
 
 
@@ -79,11 +79,9 @@ def test_python_annotator_adds_function_argument_annotations() -> None:
         ]
     )
     annotated, warnings = PythonAnnotator().annotate_source(source)
+    assert "# xpyannotate: intent n=in, x=in, a=in" in annotated
     assert "def f(n: int, x: Array1D[float], a: float = 1.0) -> float:" in annotated
-    messages = [warning.message for warning in warnings]
-    assert "parameter n intent=in" in messages
-    assert "parameter x intent=in" in messages
-    assert "parameter a intent=in" in messages
+    assert warnings == []
 
 
 def test_python_annotator_adds_final_locals_inside_function() -> None:
@@ -102,13 +100,31 @@ def test_python_annotator_adds_final_locals_inside_function() -> None:
         ]
     )
     annotated, warnings = PythonAnnotator().annotate_source(source)
+    assert "# xpyannotate: intent x=local-rebind, k=in" in annotated
     assert "n: Final[int] = len(x)" in annotated
-    assert "xc: Final[Array1D[float]] = x - x.mean()" in annotated
+    assert "xc: Final[Array1D[float]] = x - x.mean()  # xpyannotate: readonly-array" in annotated
     assert "denom: Final[float] = np.dot(xc, xc)" in annotated
-    assert "acf: Final[Array1D[float]] = np.empty(k, dtype=float)" in annotated
-    messages = [warning.message for warning in warnings]
-    assert "parameter x intent=rebound" in messages
-    assert "parameter k intent=in" in messages
+    assert "acf: Final[Array1D[float]] = np.empty(k, dtype=float)  # xpyannotate: readonly-array" in annotated
+    assert warnings == []
+
+
+def test_python_annotator_only_marks_non_mutated_arrays_with_generated_comment() -> None:
+    source = "\n".join(
+        [
+            "import numpy as np",
+            "",
+            "def f(n: int):",
+            "    x = np.empty(n)",
+            "    x[0] = 1.0",
+            "    y = np.arange(n)",
+            "    return x, y",
+            "",
+        ]
+    )
+    annotated, _warnings = PythonAnnotator().annotate_source(source)
+    assert "x: Final[Array1D[float]] = np.empty(n)" in annotated
+    assert "x: Final[Array1D[float]] = np.empty(n)  # xpyannotate: readonly-array" not in annotated
+    assert "y: Final[Array1D[float]] = np.arange(n)  # xpyannotate: readonly-array" in annotated
 
 
 def test_python_annotator_upgrades_existing_annotation_to_final() -> None:
@@ -122,7 +138,8 @@ def test_python_annotator_upgrades_existing_annotation_to_final() -> None:
     )
     annotated, warnings = PythonAnnotator().annotate_source(source)
     assert "n: Final[int] = len(x)" in annotated
-    assert [warning.message for warning in warnings] == ["parameter x intent=in"]
+    assert "# xpyannotate: intent x=in" in annotated
+    assert warnings == []
 
 
 def test_python_annotator_warns_on_unstable_return_types() -> None:
@@ -161,9 +178,8 @@ def test_python_annotator_inferrs_int_from_annotated_callee_and_shape_expr() -> 
     )
     annotated, warnings = PythonAnnotator().annotate_source(source)
     assert "def empirical_pacf(x: Array1D[float], k: int) -> Array1D[float]:" in annotated
-    messages = [warning.message for warning in warnings]
-    assert "parameter x intent=in" in messages
-    assert "parameter k intent=in" in messages
+    assert "# xpyannotate: intent x=in, k=in" in annotated
+    assert warnings == []
 
 
 def test_python_annotator_reports_parameter_intents() -> None:
@@ -176,11 +192,9 @@ def test_python_annotator_reports_parameter_intents() -> None:
             "",
         ]
     )
-    _annotated, warnings = PythonAnnotator().annotate_source(source)
-    messages = [warning.message for warning in warnings]
-    assert "parameter x intent=in" in messages
-    assert "parameter y intent=rebound" in messages
-    assert "parameter z intent=mutated" in messages
+    annotated, warnings = PythonAnnotator().annotate_source(source)
+    assert "# xpyannotate: intent x=in, y=local-rebind, z=inout" in annotated
+    assert warnings == []
 
 
 def test_python_annotator_can_disable_parameter_intents() -> None:
@@ -191,7 +205,8 @@ def test_python_annotator_can_disable_parameter_intents() -> None:
             "",
         ]
     )
-    _annotated, warnings = PythonAnnotator().annotate_source(source, infer_intent=False)
+    annotated, warnings = PythonAnnotator().annotate_source(source, infer_intent=False)
+    assert "# xpyannotate: intent" not in annotated
     assert warnings == []
 
 
@@ -258,3 +273,20 @@ def test_xpyannotate_cli_can_disable_intent_warnings(tmp_path: Path) -> None:
     warnings_path = tmp_path / "demo_annotated.py.warnings.txt"
     assert not warnings_path.exists()
     assert "intent=" not in proc.stdout
+
+
+def test_xpyannotate_emits_intent_comments_in_output(tmp_path: Path) -> None:
+    input_path = tmp_path / "demo.py"
+    input_path.write_text("def f(x, y):\n    y[0] = x[0]\n    return y\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(XPYANNOTATE_PATH), str(input_path)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    output_text = (tmp_path / "demo_annotated.py").read_text(encoding="utf-8")
+    assert "# xpyannotate: intent x=in, y=inout" in output_text

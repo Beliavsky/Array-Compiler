@@ -7,6 +7,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 X2F_BATCH_PATH = REPO_ROOT / "x2f_batch.py"
+R_EXAMPLES_DIR = Path(r"c:\python\public_domain\github\Pure-Fortran-Examples\r_examples_1")
 
 
 def test_x2f_batch_stops_on_first_failure_and_writes_csv(tmp_path: Path) -> None:
@@ -67,8 +68,8 @@ def test_x2f_batch_prints_grouped_failures(tmp_path: Path) -> None:
     bad1_path = tmp_path / "bad1.py"
     bad2_path = tmp_path / "bad2.py"
 
-    bad1_path.write_text("import numpy as np\nprint(np.sign(np.array([1.0, -2.0])))\n", encoding="utf-8")
-    bad2_path.write_text("import numpy as np\nx = np.sign(np.array([3.0]))\nprint(x)\n", encoding="utf-8")
+    bad1_path.write_text("import numpy as np\nprint(np.meshgrid(np.array([1.0]), np.array([2.0])))\n", encoding="utf-8")
+    bad2_path.write_text("import numpy as np\nx = np.meshgrid(np.array([3.0]), np.array([4.0]))\nprint(x)\n", encoding="utf-8")
 
     proc = subprocess.run(
         [
@@ -86,4 +87,28 @@ def test_x2f_batch_prints_grouped_failures(tmp_path: Path) -> None:
 
     assert proc.returncode != 0
     assert "Failure groups:" in proc.stdout
-    assert "unsupported call: np.sign" in proc.stdout
+    assert "np.meshgrid is only supported in tuple assignment" in proc.stdout
+
+
+def test_x2f_batch_accepts_r_sources_and_runs_run_both(tmp_path: Path) -> None:
+    local_input = tmp_path / "test31_fun_scalar.r"
+    local_input.write_text((R_EXAMPLES_DIR / "test31_fun_scalar.r").read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(X2F_BATCH_PATH),
+            str(local_input),
+            "--run-both",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[1/1]" in proc.stdout
+    assert "Run (r): PASS" in proc.stdout
+    assert "Build: PASS" in proc.stdout
+    assert "Totals: 1 files, 1 pass, 0 fail" in proc.stdout

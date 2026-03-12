@@ -22,9 +22,12 @@ from x2f import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 X2F_PATH = REPO_ROOT / "x2f.py"
 XBS_PATH = Path(r"c:\python\public_domain\github\Pure-Fortran-Examples\option_pricing\xbs.py")
+T025_PATH = Path(r"c:\python\public_domain\github\Pure-Fortran-Examples\python_numpy_examples_1\t025_linalg_eig_svd.py")
 XAR_PATH = REPO_ROOT / "xar_sim.py"
 XAR_ACF_PACF_PATH = REPO_ROOT / "xar_sim_acf_pacf.py"
 XARMA_ACF_PACF_PATH = REPO_ROOT / "xarma_sim_acf_pacf.py"
+XGARCH_FIT_GRID_PATH = REPO_ROOT / "xgarch_fit_grid.py"
+XCCC_GARCH_SIM_PATH = REPO_ROOT / "xccc_garch_sim.py"
 
 
 def test_x2f_time_both_runs_end_to_end(tmp_path: Path) -> None:
@@ -73,6 +76,25 @@ def test_x2f_run_both_runs_end_to_end_without_diff_or_timings(tmp_path: Path) ->
     assert "Timing summary (seconds):" not in stdout
     assert (tmp_path / "xbs_p.f90").exists()
     assert (tmp_path / "xbs_p.exe").exists()
+
+
+def test_x2f_print_main_shows_generated_driver(tmp_path: Path) -> None:
+    local_input = tmp_path / "xbs.py"
+    local_input.write_text(XBS_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile", "--print-main"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    stdout = proc.stdout
+    assert "program xbs_p_driver" in stdout
+    assert "use xbs_p, only:" in stdout
+    assert "call " in stdout
+    assert "end program xbs_p_driver" in stdout
 
 
 def test_x2f_does_not_print_timing_summary_when_transpile_fails(tmp_path: Path) -> None:
@@ -136,6 +158,155 @@ def test_x2f_compile_builds_executable_for_xar_sim_acf_pacf(tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert (tmp_path / "xar_sim_acf_pacf_p.exe").exists()
+
+
+def test_x2f_replaces_simple_ac_array_with_native_constructor(tmp_path: Path) -> None:
+    local_input = tmp_path / "xar_sim.py"
+    local_input.write_text(XAR_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xar_sim_p.f90").read_text(encoding="utf-8")
+    assert "real(dp), parameter :: phi(3) = [0.7d0, -0.2d0, 0.1d0]" in generated
+    assert "ac_array(" not in generated
+
+
+def test_x2f_compile_builds_executable_for_linalg_eig_svd_example(tmp_path: Path) -> None:
+    local_input = tmp_path / "t025_linalg_eig_svd.py"
+    local_input.write_text(T025_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Auto helper files:" in proc.stdout
+    assert "lapack_d.f90" in proc.stdout
+    assert "Build: PASS" in proc.stdout
+    assert (tmp_path / "t025_linalg_eig_svd_p.exe").exists()
+
+
+def test_x2f_compile_builds_executable_for_ccc_garch_cholesky_example(tmp_path: Path) -> None:
+    local_input = tmp_path / "xccc_garch_sim.py"
+    local_input.write_text(XCCC_GARCH_SIM_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert (tmp_path / "xccc_garch_sim_p.exe").exists()
+
+
+def test_x2f_uses_meaningful_terminal_local_as_function_result(tmp_path: Path) -> None:
+    local_input = tmp_path / "xgarch_fit_grid.py"
+    local_input.write_text(XGARCH_FIT_GRID_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xgarch_fit_grid_p.f90").read_text(encoding="utf-8")
+    assert "function read_returns(filename) result(x)" in generated
+    assert "real(dp), allocatable :: x(:)" in generated
+    assert "result_value = x" not in generated
+    assert "ac_copy(" not in generated
+
+
+def test_x2f_replaces_first_ac_empty_assignment_with_allocate(tmp_path: Path) -> None:
+    local_input = tmp_path / "xgarch_fit_grid.py"
+    local_input.write_text(XGARCH_FIT_GRID_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xgarch_fit_grid_p.f90").read_text(encoding="utf-8")
+    assert "allocate(h(n))" in generated
+    assert "h = ac_empty(n)" not in generated
+    assert "best_params = params" in generated
+    assert "ac_copy(" not in generated
+
+
+def test_x2f_shifts_simple_zero_based_loops_to_one_based_fortran(tmp_path: Path) -> None:
+    local_input = tmp_path / "xgarch_fit_grid.py"
+    local_input.write_text(XGARCH_FIT_GRID_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xgarch_fit_grid_p.f90").read_text(encoding="utf-8")
+    assert "do omega_index = 1, size(omega_grid)" in generated
+    assert "do alpha_index = 1, size(alpha_grid)" in generated
+    assert "do beta_index = 1, size(beta_grid)" in generated
+    assert "omega = omega_grid(omega_index)" in generated
+    assert "alpha = alpha_grid(alpha_index)" in generated
+    assert "beta = beta_grid(beta_index)" in generated
+    assert "omega_grid(omega_index + 1)" not in generated
+
+
+def test_x2f_collapses_copy_reshape_center_sequence(tmp_path: Path) -> None:
+    local_input = tmp_path / "xgarch_fit_grid.py"
+    local_input.write_text(XGARCH_FIT_GRID_PATH.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xgarch_fit_grid_p.f90").read_text(encoding="utf-8")
+    assert "x = x_arg - ac_mean(x_arg)" in generated
+    assert "x = ac_reshape(ac_asarray(x), -1)" not in generated
+    assert "x = x - ac_mean(x)" not in generated
+
+
+def test_x2f_replaces_first_ac_empty2_assignment_with_allocate(tmp_path: Path) -> None:
+    source_path = Path(
+        r"c:\python\public_domain\github\Pure-Fortran-Examples\mixtures\xsim_mix_mv.py"
+    )
+    local_input = tmp_path / "xsim_mix_mv.py"
+    local_input.write_text(source_path.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(X2F_PATH), str(local_input), "--style-level", "full"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = (tmp_path / "xsim_mix_mv_p.f90").read_text(encoding="utf-8")
+    assert "allocate(x(n, d))" in generated
+    assert "x = ac_empty2(n, d)" not in generated
 
 
 def test_x2f_does_not_print_timing_summary_when_build_fails(tmp_path: Path) -> None:
@@ -343,9 +514,15 @@ def test_nonconsecutive_like_local_declarations_are_grouped(tmp_path: Path) -> N
         fortran_source.index("function theoretical_acovf_arma"):
         fortran_source.index("end function theoretical_acovf_arma")
     ]
+    local_decl_line = next(
+        line for line in block.splitlines()
+        if "real(dp), allocatable :: ar(:), ma(:), theta(:), psi(:), a(:, :), b(:), &" in line
+    )
 
+    assert "function theoretical_acovf_arma(ar_arg, ma_arg, sigma, k) result(gamma)" in block
     assert "real(dp), allocatable :: ar(:), ma(:), theta(:), psi(:), a(:, :), b(:), &" in block
-    assert "& gamma0_to_m(:), gamma(:)" in block
+    assert "& gamma0_to_m(:)" in block
+    assert "gamma(:)" not in local_decl_line
     assert "integer :: p, q, m, h, i, j" in block
 
 

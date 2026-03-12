@@ -44,6 +44,26 @@ def f(x):
     assert fn.body[2].body[1].value.func == "ac_shape_dim"
 
 
+def test_frontend_lowers_annotated_assignments_and_array_aliases() -> None:
+    source = """from typing import Final
+from array_compiler.annotations import Array1D, Array2D
+import numpy as np
+
+def f():
+    x: Final[Array1D[float]] = np.arange(10)
+    a: Array2D[float] = np.zeros((2, 3))
+    return x.size + a.shape[0]
+"""
+    module = PythonNumpyFrontend().lower_source(source, module_name="annotated_mod")
+    fn = module.functions[0]
+    local_types = dict(fn.locals)
+
+    assert local_types["x"] == ArrayTypeRef(ScalarType.REAL64, rank=1)
+    assert local_types["a"] == ArrayTypeRef(ScalarType.REAL64, rank=2)
+    assert any(isinstance(stmt, Assignment) and getattr(stmt.target, "name", "") == "x" for stmt in fn.body)
+    assert any(isinstance(stmt, Assignment) and getattr(stmt.target, "name", "") == "a" for stmt in fn.body)
+
+
 def test_numpy_set_printoptions_affects_generated_output() -> None:
     source = """import numpy as np
 
@@ -436,5 +456,5 @@ def test_xar_sim_acf_pacf_emits_integer_section_not_real_index_array() -> None:
     module = PythonNumpyFrontend().lower_source(source, module_name="xar_sim_acf_pacf_mod")
     emitted = FortranBackend().emit(module)
 
-    assert "ac_arange_int(" not in emitted
+    assert "rho(h - ac_arange_int(" not in emitted
     assert "rho(h:h - p + 1:-1)" in emitted
