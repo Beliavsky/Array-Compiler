@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import locale
 import math
 import os
 import re
@@ -25,20 +26,23 @@ from array_compiler.ir.nodes import Function
 HELPER_MODULE_KEYS = {
     "kind_mod": "kind_mod",
     "ac_constants_mod": "ac_constants",
+    "ac_stats_mod": "ac_stats",
     "ac_string_mod": "ac_string",
     "ac_random_support": "ac_random",
     "ac_numpy_mod": "ac_numpy",
     "ac_lapack_mod": "ac_lapack",
 }
 
-HELPER_ORDER = ["kind_mod", "ac_constants", "ac_string", "ac_random", "ac_numpy", "ac_lapack", "lapack_d", "python", "octave_funcs", "r"]
+HELPER_ORDER = ["kind_mod", "ac_constants", "ac_stats", "ac_string", "ac_random", "ac_numpy", "ac_lapack", "lapack_d", "python", "octave_funcs", "r"]
 HELPER_DEPENDENCIES = {
+    "ac_stats": {"ac_constants"},
     "ac_numpy": {"ac_random"},
     "ac_lapack": {"lapack_d"},
 }
 HELPER_MOD_FILES = {
     "kind_mod": "kind_mod.mod",
     "ac_constants": "ac_constants_mod.mod",
+    "ac_stats": "ac_stats_mod.mod",
     "ac_string": "ac_string_mod.mod",
     "ac_random": "ac_random_support.mod",
     "ac_numpy": "ac_numpy_mod.mod",
@@ -58,9 +62,36 @@ def format_command(parts: list[str]) -> str:
     return " ".join(quote_cmd_arg(part) for part in parts)
 
 
+def _decode_output(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    for encoding in ("utf-8", locale.getpreferredencoding(False) or "utf-8", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def emit_text(text: str) -> None:
+    if not text:
+        return
+    encoding = getattr(sys.stdout, "encoding", None) or locale.getpreferredencoding(False) or "utf-8"
+    try:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(text.encode(encoding, errors="replace"))
+        if not text.endswith("\n"):
+            sys.stdout.buffer.write(b"\n")
+
+
 def run_capture(cmd: list[str], *, cwd: Path) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
-    return proc.returncode, proc.stdout, proc.stderr
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=False, check=False)
+    return proc.returncode, _decode_output(proc.stdout), _decode_output(proc.stderr)
 
 
 def helper_keys_for_source(fortran_source: str) -> list[str]:
@@ -111,22 +142,28 @@ def build_driver_source(module_name: str, entry_name: str) -> str:
     )
 
 
-def emit_timing_summary(timings: dict[str, float]) -> None:
+def emit_timing_summary(timings: dict[str, float], *, source_run_label: str = "python run") -> None:
     if not timings:
         return
     print("Timing summary (seconds):")
-    base = timings.get("python run")
+    base = timings.get(source_run_label)
     rows: list[tuple[str, float, float | None]] = []
-    order = ["python run", "transpile", "compile", "fortran run", "total"]
+    order = [source_run_label, "transpile", "compile", "fortran run", "total"]
     for name in order:
         if name in timings:
             value = timings[name]
             ratio = (value / base) if (base is not None and base > 0.0) else None
             rows.append((name, value, ratio))
-    print("  stage         seconds    ratio(vs python run)")
+    stage_header = "stage"
+    seconds_header = "seconds"
+    ratio_header = f"ratio(vs {source_run_label})"
+    stage_width = max(len(stage_header), *(len(name) for name, _, _ in rows))
+    seconds_width = max(len(seconds_header), 9)
+    ratio_width = max(len(ratio_header), 22)
+    print(f"  {stage_header:<{stage_width}}  {seconds_header:>{seconds_width}}  {ratio_header:>{ratio_width}}")
     for name, value, ratio in rows:
-        ratio_text = f"{ratio:>22.6f}" if ratio is not None else " " * 22
-        print(f"  {name:<12} {value:>9.6f}{ratio_text}")
+        ratio_text = f"{ratio:>{ratio_width}.6f}" if ratio is not None else " " * ratio_width
+        print(f"  {name:<{stage_width}}  {value:>{seconds_width}.6f}  {ratio_text}")
 
 
 NUMERIC_TOKEN_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?")
@@ -207,6 +244,13 @@ def detect_source_language(input_path: Path) -> str:
     if suffix in {".r", ".R"}:
         return "r"
     raise ValueError(f"unsupported source suffix {suffix!r}; expected .py, .r, or .R")
+
+
+def default_fortran_output_tag(input_path: Path) -> str:
+    suffix = input_path.suffix.lower().lstrip(".")
+    if suffix == "py":
+        return "p"
+    return suffix or "src"
 
 
 def frontend_for_language(language: str):
@@ -407,31 +451,34 @@ def main() -> int:
         args.compile = True
 
     input_path = Path(args.input_py).resolve()
-    output_path = Path(args.out).resolve() if args.out else input_path.with_name(f"{input_path.stem}_p.f90")
+    source_language = detect_source_language(input_path)
+    output_tag = default_fortran_output_tag(input_path)
+    output_path = Path(args.out).resolve() if args.out else input_path.with_name(f"{input_path.stem}_{output_tag}.f90")
+    source_run_label = "python run" if source_language == "python" else f"{source_language.upper()} run"
     timings: dict[str, float] = {}
     python_stdout = ""
     python_rc = 0
 
     if args.time_both or args.run_both:
         py_cmd = source_run_command(input_path)
-        print(f"Run ({detect_source_language(input_path)}):", format_command(py_cmd))
+        print(f"Run ({source_language}):", format_command(py_cmd))
         t0 = time.perf_counter()
         python_rc, python_stdout, python_stderr = run_capture(py_cmd, cwd=input_path.parent)
-        timings["python run"] = time.perf_counter() - t0
+        timings[source_run_label] = time.perf_counter() - t0
         if python_rc != 0:
-            print(f"Run ({detect_source_language(input_path)}): FAIL (exit {python_rc})")
+            print(f"Run ({source_language}): FAIL (exit {python_rc})")
             if python_stdout.strip():
-                print(python_stdout.rstrip())
+                emit_text(python_stdout.rstrip())
             if python_stderr.strip():
-                print(python_stderr.rstrip())
+                emit_text(python_stderr.rstrip())
             if args.time_both:
-                emit_timing_summary(timings)
+                emit_timing_summary(timings, source_run_label=source_run_label)
             return python_rc
-        print(f"Run ({detect_source_language(input_path)}): PASS")
+        print(f"Run ({source_language}): PASS")
         if python_stdout.strip():
-            print(python_stdout.rstrip())
+            emit_text(python_stdout.rstrip())
         if python_stderr.strip():
-            print(python_stderr.rstrip())
+            emit_text(python_stderr.rstrip())
 
     t0 = time.perf_counter()
     try:
@@ -508,9 +555,9 @@ def main() -> int:
         if compile_proc.returncode != 0:
             print(f"Build: FAIL (exit {compile_proc.returncode})")
             if compile_proc.stdout.strip():
-                print(compile_proc.stdout.rstrip())
+                emit_text(compile_proc.stdout.rstrip())
             if compile_proc.stderr.strip():
-                print(compile_proc.stderr.rstrip())
+                emit_text(compile_proc.stderr.rstrip())
             return compile_proc.returncode
         print("Build: PASS")
 
@@ -521,23 +568,23 @@ def main() -> int:
             if run_rc != 0:
                 print(f"Run: FAIL (exit {run_rc})")
                 if fortran_stdout.strip():
-                    print(fortran_stdout.rstrip())
+                    emit_text(fortran_stdout.rstrip())
                 if fortran_stderr.strip():
-                    print(fortran_stderr.rstrip())
+                    emit_text(fortran_stderr.rstrip())
                 if args.time_both:
-                    emit_timing_summary(timings)
+                    emit_timing_summary(timings, source_run_label=source_run_label)
                 return run_rc
             print("Run: PASS")
             if fortran_stdout.strip():
-                print(fortran_stdout.rstrip())
+                emit_text(fortran_stdout.rstrip())
             if fortran_stderr.strip():
-                print(fortran_stderr.rstrip())
+                emit_text(fortran_stderr.rstrip())
             if args.time_both:
                 compare_outputs(python_stdout, fortran_stdout, stochastic=("ac_random" in helper_keys))
 
     if args.time_both:
         timings["total"] = timings.get("transpile", 0.0) + timings.get("compile", 0.0) + timings.get("fortran run", 0.0)
-        emit_timing_summary(timings)
+        emit_timing_summary(timings, source_run_label=source_run_label)
     return 0
 
 

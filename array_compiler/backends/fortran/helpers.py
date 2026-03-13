@@ -25,6 +25,7 @@ class HelperRegistry:
         self._helpers: dict[str, HelperModule] = {
             "kind_mod": HelperModule("kind_mod", "kind.f90", "Shared kind parameters for generated Fortran"),
             "ac_constants": HelperModule("ac_constants", "ac_constants.f90", "Named mathematical constants for generated Fortran"),
+            "ac_stats": HelperModule("ac_stats", "ac_stats.f90", "Statistical runtime helpers for generated Fortran"),
             "ac_string": HelperModule("ac_string", "ac_string.f90", "Small string helper runtime for generated Fortran"),
             "ac_random": HelperModule("ac_random", "ac_random.f90", "Small RNG helper runtime for translated scalar Monte Carlo code"),
             "ac_numpy": HelperModule("ac_numpy", "ac_numpy.f90", "Small NumPy-style runtime helpers for generated Fortran"),

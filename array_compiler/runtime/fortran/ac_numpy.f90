@@ -89,12 +89,15 @@ interface ac_searchsorted_right
 end interface
 
 interface ac_column_stack
+    module procedure ac_column_stack_2_real
     module procedure ac_column_stack_3_real
     module procedure ac_column_stack_4_real
     module procedure ac_column_stack_int_real3
 end interface
 
 interface ac_repeat
+    module procedure ac_repeat_scalar_real
+    module procedure ac_repeat_scalar_int
     module procedure ac_repeat_1d_real
     module procedure ac_repeat_1d_int
 end interface
@@ -163,6 +166,8 @@ interface ac_tile
 end interface
 
 interface ac_diag
+    module procedure ac_diag_from_size_int
+    module procedure ac_diag_from_size_real
     module procedure ac_diag_from_vec_real
     module procedure ac_diag_from_vec_int
     module procedure ac_diag_from_mat_real
@@ -421,9 +426,11 @@ interface ac_where_select
     module procedure ac_where_select_1d_real_real
     module procedure ac_where_select_1d_real_scalar
     module procedure ac_where_select_1d_scalar_real
+    module procedure ac_where_select_1d_scalar_scalar_real
     module procedure ac_where_select_1d_int_int
     module procedure ac_where_select_1d_int_scalar
     module procedure ac_where_select_1d_scalar_int
+    module procedure ac_where_select_1d_scalar_scalar_int
 end interface
 
 interface ac_savetxt
@@ -1133,6 +1140,16 @@ x(:, 3) = c
 x(:, 4) = d
 end function ac_column_stack_4_real
 
+pure function ac_column_stack_2_real(a, b) result(x)
+real(dp), intent(in) :: a(:), b(:)
+real(dp), allocatable :: x(:, :)
+integer :: n
+n = size(a)
+allocate(x(n, 2))
+x(:, 1) = a
+x(:, 2) = b
+end function ac_column_stack_2_real
+
 pure function ac_column_stack_3_real(a, b, c) result(x)
 real(dp), intent(in) :: a(:), b(:), c(:)
 real(dp), allocatable :: x(:, :)
@@ -1645,6 +1662,18 @@ elsewhere
 end where
 end function ac_where_select_1d_scalar_real
 
+pure function ac_where_select_1d_scalar_scalar_real(mask, x_true, x_false) result(y)
+logical, intent(in) :: mask(:)
+real(dp), intent(in) :: x_true, x_false
+real(dp), allocatable :: y(:)
+allocate(y(size(mask)))
+where (mask)
+    y = x_true
+elsewhere
+    y = x_false
+end where
+end function ac_where_select_1d_scalar_scalar_real
+
 pure function ac_where_select_1d_int_int(mask, x_true, x_false) result(y)
 logical, intent(in) :: mask(:)
 integer, intent(in) :: x_true(:), x_false(:)
@@ -1682,6 +1711,18 @@ elsewhere
     y = x_false
 end where
 end function ac_where_select_1d_scalar_int
+
+pure function ac_where_select_1d_scalar_scalar_int(mask, x_true, x_false) result(y)
+logical, intent(in) :: mask(:)
+integer, intent(in) :: x_true, x_false
+integer, allocatable :: y(:)
+allocate(y(size(mask)))
+where (mask)
+    y = x_true
+elsewhere
+    y = x_false
+end where
+end function ac_where_select_1d_scalar_scalar_int
 
 pure function ac_row_2d_real(x, row_index) result(y)
 real(dp), intent(in) :: x(:, :)
@@ -2881,9 +2922,27 @@ do i = 1, size(x)
     do j = 1, reps
         k = k + 1
         y(k) = x(i)
-    end do
+end do
 end do
 end function ac_repeat_1d_int
+
+pure function ac_repeat_scalar_real(x, reps) result(y)
+real(dp), intent(in) :: x
+integer, intent(in) :: reps
+real(dp), allocatable :: y(:)
+
+allocate(y(reps))
+y = x
+end function ac_repeat_scalar_real
+
+pure function ac_repeat_scalar_int(x, reps) result(y)
+integer, intent(in) :: x
+integer, intent(in) :: reps
+integer, allocatable :: y(:)
+
+allocate(y(reps))
+y = x
+end function ac_repeat_scalar_int
 
 pure function ac_repeat_1d_real(x, reps) result(y)
 real(dp), intent(in) :: x(:)
@@ -3014,6 +3073,31 @@ do i = 1, size(v)
     x(i, i) = v(i)
 end do
 end function ac_diag_from_vec_int
+
+pure function ac_diag_from_size_int(n) result(x)
+integer, intent(in) :: n
+real(dp), allocatable :: x(:, :)
+integer :: i
+
+allocate(x(n, n))
+x = 0.0_dp
+do i = 1, n
+    x(i, i) = 1.0_dp
+end do
+end function ac_diag_from_size_int
+
+pure function ac_diag_from_size_real(n) result(x)
+real(dp), intent(in) :: n
+real(dp), allocatable :: x(:, :)
+integer :: i, n_int
+
+n_int = int(n)
+allocate(x(n_int, n_int))
+x = 0.0_dp
+do i = 1, n_int
+    x(i, i) = 1.0_dp
+end do
+end function ac_diag_from_size_real
 
 pure function ac_diag_from_vec_real(v) result(x)
 real(dp), intent(in) :: v(:)

@@ -190,7 +190,11 @@ class PythonNumpyFrontend:
                     inferred_value = self._map_annotation(stmt.annotation, function_name) or self._infer_type(stmt.value)
                     self._current_symbols[stmt.target.id] = inferred_value
                 if isinstance(stmt, ast.Return) and stmt.value is not None:
-                    refined = self._merge_types(refined, self._infer_type(stmt.value))
+                    if isinstance(refined, RecordTypeRef) and isinstance(stmt.value, (ast.Dict, ast.Tuple)):
+                        value_type = refined
+                    else:
+                        value_type = self._infer_type(stmt.value)
+                    refined = self._merge_types(refined, value_type)
             return refined
         finally:
             self._current_symbols = saved_symbols
@@ -362,7 +366,8 @@ class PythonNumpyFrontend:
 
     def _function_leading_comments(self, node: ast.FunctionDef) -> list[str]:
         first_stmt_line = node.body[0].lineno if node.body else node.lineno + 1
-        comments = self._leading_comments_after_line(node.lineno, first_stmt_line)
+        comments = self._attached_comments_before_stmt(node, 0)
+        comments.extend(self._leading_comments_after_line(node.lineno, first_stmt_line))
         docstring_lines = self._function_docstring_lines(node)
         if docstring_lines:
             comments.extend(docstring_lines)
@@ -533,9 +538,9 @@ class PythonNumpyFrontend:
                     and isinstance(stmt.targets[0], ast.Tuple)
                     and isinstance(stmt.value, ast.Attribute)
                     and stmt.value.attr == "shape"
-                    and isinstance(stmt.value.value, ast.Name)
                 ):
-                    if self._set_array_rank(arg_types, aliases, stmt.value.value.id, len(stmt.targets[0].elts)):
+                    shape_name = self._shape_base_name(stmt.value)
+                    if shape_name is not None and self._set_array_rank(arg_types, aliases, shape_name, len(stmt.targets[0].elts)):
                         changed = True
                 if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                     target_name = stmt.targets[0].id
@@ -572,9 +577,9 @@ class PythonNumpyFrontend:
                     if stmt.attr == "shape":
                         pass
                 if isinstance(stmt, ast.Subscript) and self._is_shape_dim_access(stmt):
-                    name = stmt.value.value.id
+                    name = self._shape_base_name(stmt.value)
                     rank = self._const_int_value(stmt.slice) + 1
-                    if self._set_array_rank(arg_types, aliases, name, rank):
+                    if name is not None and self._set_array_rank(arg_types, aliases, name, rank):
                         changed = True
                 if isinstance(stmt, ast.Call) and isinstance(stmt.func, ast.Attribute):
                     chain = self._attr_chain(stmt.func)
@@ -736,6 +741,8 @@ class PythonNumpyFrontend:
     def _infer_ir_type(self, expr: object) -> object:
         if isinstance(expr, ValueRef):
             return self._current_symbols.get(expr.name, ScalarType.REAL64)
+        if isinstance(expr, RecordLiteral):
+            return RecordTypeRef(expr.type_name)
         if isinstance(expr, Constant):
             if isinstance(expr.value, int):
                 return ScalarType.INTEGER
@@ -743,6 +750,19 @@ class PythonNumpyFrontend:
                 return ScalarType.REAL64
             if isinstance(expr.value, str):
                 return ScalarType.STRING
+            if isinstance(expr.value, bool):
+                return ScalarType.LOGICAL
+        if isinstance(expr, Compare):
+            left_type = self._infer_ir_type(expr.left)
+            right_type = self._infer_ir_type(expr.right)
+            if isinstance(left_type, ArrayTypeRef) or isinstance(right_type, ArrayTypeRef):
+                rank = 1
+                if isinstance(left_type, ArrayTypeRef):
+                    rank = max(rank, left_type.rank)
+                if isinstance(right_type, ArrayTypeRef):
+                    rank = max(rank, right_type.rank)
+                return ArrayTypeRef(ScalarType.LOGICAL, rank=rank)
+            return ScalarType.LOGICAL
         if isinstance(expr, Call):
             if expr.func in self._function_result_types:
                 return self._function_result_types[expr.func]
@@ -769,6 +789,18 @@ class PythonNumpyFrontend:
                 return ArrayTypeRef(element_type, rank=rank)
             if expr.func == "ac_where":
                 return ArrayTypeRef(ScalarType.INTEGER)
+            if expr.func == "ac_where_select":
+                cond_type = self._infer_ir_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.LOGICAL)
+                true_type = self._infer_ir_type(expr.args[1]) if len(expr.args) > 1 else ScalarType.REAL64
+                false_type = self._infer_ir_type(expr.args[2]) if len(expr.args) > 2 else ScalarType.REAL64
+                rank = cond_type.rank if isinstance(cond_type, ArrayTypeRef) else 1
+                if isinstance(true_type, ArrayTypeRef):
+                    return true_type
+                if isinstance(false_type, ArrayTypeRef):
+                    return false_type
+                if true_type == ScalarType.INTEGER and false_type == ScalarType.INTEGER:
+                    return ArrayTypeRef(ScalarType.INTEGER, rank=rank)
+                return ArrayTypeRef(ScalarType.REAL64, rank=rank)
             if expr.func == "ac_multivariate_normal":
                 return ArrayTypeRef(ScalarType.REAL64, rank=2)
             if expr.func == "ac_choice_weighted":
@@ -801,7 +833,15 @@ class PythonNumpyFrontend:
                 return ScalarType.INTEGER
             if expr.func == "ac_parse_real":
                 return ScalarType.REAL64
+            if expr.func == "ac_shape_dim":
+                return ScalarType.INTEGER
             if expr.func == "ac_wall_time":
+                return ScalarType.REAL64
+            if expr.func in {"ac_dnorm", "ac_dnorm_log"}:
+                if expr.args:
+                    arg_type = self._infer_type(expr.args[0])
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return arg_type
                 return ScalarType.REAL64
             if expr.func in {"trim", "adjustl", "ac_lower", "ac_format_default", "ac_format_fixed", "ac_format_scientific", "ac_format_int"}:
                 return ScalarType.STRING
@@ -825,6 +865,8 @@ class PythonNumpyFrontend:
             right_type = self._infer_ir_type(expr.right)
             if isinstance(left_type, ArrayTypeRef) or isinstance(right_type, ArrayTypeRef):
                 return self._combine_array_types(left_type, right_type)
+            if expr.op in {BinaryOperator.AND, BinaryOperator.OR}:
+                return ScalarType.LOGICAL
             if left_type == ScalarType.INTEGER and right_type == ScalarType.INTEGER:
                 return ScalarType.INTEGER
             return ScalarType.REAL64
@@ -852,10 +894,18 @@ class PythonNumpyFrontend:
 
     def _collect_locals(self, stmt: ast.stmt, locals_map: dict[str, object]) -> None:
         if isinstance(stmt, ast.Assign):
-            inferred = self._infer_type(stmt.value)
             self._collect_expr_locals(stmt.value, locals_map)
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
+                    if isinstance(stmt.value, ast.Dict):
+                        typed_fields: list[tuple[str, object]] = []
+                        for key, value in zip(stmt.value.keys, stmt.value.values, strict=True):
+                            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                                raise NotImplementedError(f"unsupported dict key: {ast.dump(key)}")
+                            typed_fields.append((key.value, self._infer_type(value)))
+                        inferred = self._ensure_record(f"{target.id}_record", typed_fields)
+                    else:
+                        inferred = self._infer_type(stmt.value)
                     current = locals_map.get(target.id)
                     if (
                         isinstance(current, ArrayTypeRef)
@@ -895,7 +945,17 @@ class PythonNumpyFrontend:
                             self._current_symbols[elt.id] = merged
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
             annotated = self._map_annotation(stmt.annotation, self._current_function or "module")
-            inferred = annotated or self._infer_type(stmt.value)
+            if annotated is not None:
+                inferred = annotated
+            elif isinstance(stmt.value, ast.Dict):
+                typed_fields: list[tuple[str, object]] = []
+                for key, value in zip(stmt.value.keys, stmt.value.values, strict=True):
+                    if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                        raise NotImplementedError(f"unsupported dict key: {ast.dump(key)}")
+                    typed_fields.append((key.value, self._infer_type(value)))
+                inferred = self._ensure_record(f"{stmt.target.id}_record", typed_fields)
+            else:
+                inferred = self._infer_type(stmt.value)
             self._collect_expr_locals(stmt.value, locals_map)
             current = locals_map.get(stmt.target.id)
             if (
@@ -917,8 +977,8 @@ class PythonNumpyFrontend:
         elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
             if isinstance(stmt.iter, ast.Call) and isinstance(stmt.iter.func, ast.Name) and stmt.iter.func.id == "range":
                 loop_name = self._loop_target_name(stmt.target.id)
-                locals_map[loop_name] = ScalarType.INTEGER
-                self._current_symbols[loop_name] = ScalarType.INTEGER
+                locals_map[loop_name] = self._merge_types(locals_map.get(loop_name), ScalarType.INTEGER)
+                self._current_symbols[loop_name] = locals_map[loop_name]
             elif isinstance(stmt.iter, ast.Tuple):
                 elt_types = [self._infer_type(elt) for elt in stmt.iter.elts]
                 target_type = elt_types[0] if elt_types else ScalarType.REAL64
@@ -942,26 +1002,49 @@ class PythonNumpyFrontend:
             for inner in stmt.orelse:
                 self._collect_locals(inner, locals_map)
         elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Tuple):
-            iter_type = self._infer_type(stmt.iter)
-            tuple_item_type = ScalarType.REAL64
-            if isinstance(iter_type, ArrayTypeRef):
-                tuple_item_type = (
-                    ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
-                    if iter_type.rank > 2
-                    else iter_type.element_type
-                )
-                loop_name = self._iter_loop_index_name(self._tuple_source_name(stmt.iter))
-                locals_map[loop_name] = ScalarType.INTEGER
-                self._current_symbols[loop_name] = ScalarType.INTEGER
-                if iter_type.rank > 1:
-                    temp_name = self._tuple_temp_name(self._tuple_source_name(stmt.iter))
-                    temp_type = ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
-                    locals_map[temp_name] = self._merge_types(locals_map.get(temp_name), temp_type)
-                    self._current_symbols[temp_name] = locals_map[temp_name]
-            for elt in stmt.target.elts:
-                if isinstance(elt, ast.Name):
-                    locals_map[elt.id] = self._merge_types(locals_map.get(elt.id), tuple_item_type)
-                    self._current_symbols[elt.id] = locals_map[elt.id]
+            if (
+                len(stmt.target.elts) == 2
+                and all(isinstance(elt, ast.Name) for elt in stmt.target.elts)
+                and isinstance(stmt.iter, ast.Call)
+                and isinstance(stmt.iter.func, ast.Name)
+                and stmt.iter.func.id == "enumerate"
+                and len(stmt.iter.args) == 1
+            ):
+                index_elt = stmt.target.elts[0]
+                value_elt = stmt.target.elts[1]
+                locals_map[index_elt.id] = self._merge_types(locals_map.get(index_elt.id), ScalarType.INTEGER)
+                self._current_symbols[index_elt.id] = locals_map[index_elt.id]
+                iter_type = self._infer_type(stmt.iter.args[0])
+                value_type: object = ScalarType.REAL64
+                if isinstance(iter_type, ArrayTypeRef):
+                    value_type = (
+                        ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
+                        if iter_type.rank > 1
+                        else iter_type.element_type
+                    )
+                locals_map[value_elt.id] = self._merge_types(locals_map.get(value_elt.id), value_type)
+                self._current_symbols[value_elt.id] = locals_map[value_elt.id]
+            else:
+                iter_type = self._infer_type(stmt.iter)
+                tuple_item_type = ScalarType.REAL64
+                if isinstance(iter_type, ArrayTypeRef):
+                    tuple_item_type = (
+                        ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
+                        if iter_type.rank > 2
+                        else iter_type.element_type
+                    )
+                    loop_name = self._iter_loop_index_name(self._tuple_source_name(stmt.iter))
+                    locals_map[loop_name] = ScalarType.INTEGER
+                    self._current_symbols[loop_name] = ScalarType.INTEGER
+                    if iter_type.rank > 1:
+                        temp_name = self._tuple_temp_name(self._tuple_source_name(stmt.iter))
+                        temp_type = ArrayTypeRef(iter_type.element_type, rank=iter_type.rank - 1)
+                        locals_map[temp_name] = self._merge_types(locals_map.get(temp_name), temp_type)
+                        self._current_symbols[temp_name] = locals_map[temp_name]
+                for elt in stmt.target.elts:
+                    if isinstance(elt, ast.Name):
+                        locals_map[elt.id] = self._merge_types(locals_map.get(elt.id), tuple_item_type)
+                        self._current_symbols[elt.id] = locals_map[elt.id]
             for inner in stmt.body:
                 self._collect_locals(inner, locals_map)
             for inner in stmt.orelse:
@@ -992,7 +1075,10 @@ class PythonNumpyFrontend:
             if isinstance(node, ast.ListComp):
                 if len(node.generators) == 1 and isinstance(node.generators[0].target, ast.Name):
                     gen = node.generators[0]
-                    if not (isinstance(gen.iter, ast.Call) and isinstance(gen.iter.func, ast.Name) and gen.iter.func.id == "range"):
+                    if isinstance(gen.iter, ast.Call) and isinstance(gen.iter.func, ast.Name) and gen.iter.func.id == "range":
+                        locals_map[gen.target.id] = self._merge_types(locals_map.get(gen.target.id), ScalarType.INTEGER)
+                        self._current_symbols[gen.target.id] = locals_map[gen.target.id]
+                    else:
                         index_name = f"{gen.target.id}_index"
                         locals_map.setdefault(index_name, ScalarType.INTEGER)
                         self._current_symbols.setdefault(index_name, ScalarType.INTEGER)
@@ -1010,6 +1096,18 @@ class PythonNumpyFrontend:
                     return Assignment(ValueRef(target.id), Call("ac_zeros", (Constant(0),)))
             if isinstance(target, ast.Tuple):
                 return self._lower_tuple_assignment(target, stmt.value)
+            if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Dict):
+                record_type = self._current_symbols.get(target.id)
+                if not isinstance(record_type, RecordTypeRef):
+                    typed_fields: list[tuple[str, object]] = []
+                    for key, value in zip(stmt.value.keys, stmt.value.values, strict=True):
+                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                            raise NotImplementedError(f"unsupported dict key: {ast.dump(key)}")
+                        typed_fields.append((key.value, self._infer_type(value)))
+                    record_type = self._ensure_record(f"{target.id}_record", typed_fields)
+                    self._current_symbols[target.id] = record_type
+                value = self._lower_named_dict(stmt.value, record_type)
+                return Assignment(ValueRef(target.id), value)
             value = self._lower_expr(stmt.value)
             if isinstance(target, ast.Name):
                 dtype_name = self._infer_dtype_name(stmt.value)
@@ -1061,6 +1159,18 @@ class PythonNumpyFrontend:
             if annotated is not None:
                 merged = self._merge_types(self._current_symbols.get(stmt.target.id), annotated)
                 self._current_symbols[stmt.target.id] = merged
+            if isinstance(stmt.value, ast.Dict):
+                record_type = self._current_symbols.get(stmt.target.id)
+                if not isinstance(record_type, RecordTypeRef):
+                    typed_fields: list[tuple[str, object]] = []
+                    for key, value in zip(stmt.value.keys, stmt.value.values, strict=True):
+                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                            raise NotImplementedError(f"unsupported dict key: {ast.dump(key)}")
+                        typed_fields.append((key.value, self._infer_type(value)))
+                    record_type = self._ensure_record(f"{stmt.target.id}_record", typed_fields)
+                    self._current_symbols[stmt.target.id] = record_type
+                value = self._lower_named_dict(stmt.value, record_type)
+                return Assignment(ValueRef(stmt.target.id), value)
             value = self._lower_expr(stmt.value)
             dtype_name = self._infer_dtype_name(stmt.value)
             if dtype_name is not None:
@@ -1112,6 +1222,10 @@ class PythonNumpyFrontend:
                     typed_fields = [(f"item{index}", self._infer_type(value)) for index, value in enumerate(stmt.value.elts, start=1)]
                     self._ensure_record(result_type.name, typed_fields)
                     return Return(RecordLiteral(result_type.name, tuple(fields)))
+            if isinstance(stmt.value, ast.Dict):
+                result_type = self._function_result_types.get(self._current_function or "")
+                if isinstance(result_type, RecordTypeRef):
+                    return Return(self._lower_named_dict(stmt.value, result_type))
             return Return(self._lower_expr(stmt.value) if stmt.value is not None else None)
         if isinstance(stmt, ast.If):
             if self._is_sys_argv_if(stmt):
@@ -1596,8 +1710,11 @@ class PythonNumpyFrontend:
             if not isinstance(gen.target, ast.Name):
                 raise NotImplementedError("only simple list comprehension targets are supported")
             return ListComprehension(gen.target.id, self._lower_expr(gen.iter), self._lower_expr(expr.elt))
+        record_type = self._infer_type(expr)
+        return self._lower_named_dict(expr, record_type if isinstance(record_type, RecordTypeRef) else None)
+
+    def _lower_named_dict(self, expr: ast.AST, record_type: RecordTypeRef | None) -> object:
         if isinstance(expr, ast.Dict):
-            record_type = self._function_result_types.get(self._current_function or "")
             if not isinstance(record_type, RecordTypeRef):
                 raise NotImplementedError("dict literal requires a structured return type")
             fields: list[tuple[str, object]] = []
@@ -2087,6 +2204,8 @@ class PythonNumpyFrontend:
                     return Call("ac_atleast_2d", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "log"]:
                     return Call("log", tuple(self._lower_expr(arg) for arg in expr.args))
+                if chain == ["np", "real"]:
+                    return self._lower_expr(expr.args[0])
                 if chain == ["np", "exp"]:
                     return Call("exp", tuple(self._lower_expr(arg) for arg in expr.args))
                 if chain == ["np", "sqrt"]:
@@ -2426,7 +2545,15 @@ class PythonNumpyFrontend:
                 return container_type.element_type
             return ScalarType.REAL64
         if isinstance(expr, ast.Dict):
-            return self._function_result_types.get(self._current_function or "", ScalarType.REAL64)
+            fields: list[tuple[str, object]] = []
+            for key, value in zip(expr.keys, expr.values, strict=True):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    raise NotImplementedError(f"unsupported dict key: {ast.dump(key)}")
+                fields.append((key.value, self._infer_type(value)))
+            base_name = self._current_function or "dict"
+            lineno = getattr(expr, "lineno", 0)
+            col = getattr(expr, "col_offset", 0)
+            return self._ensure_record(f"{base_name}_dict_{lineno}_{col}", fields)
         if isinstance(expr, ast.Tuple):
             if expr.elts and all(self._infer_type(value) == ScalarType.INTEGER for value in expr.elts):
                 return self._shape_record_type(expr, minimum_rank=len(expr.elts))
@@ -2452,10 +2579,23 @@ class PythonNumpyFrontend:
                 if isinstance(arg_type, ArrayTypeRef):
                     return ArrayTypeRef(ScalarType.REAL64, rank=arg_type.rank)
                 return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"exp", "log", "sqrt", "sin", "cos"} and expr.args:
+                arg_type = self._infer_type(expr.args[0])
+                if isinstance(arg_type, ArrayTypeRef):
+                    return ArrayTypeRef(ScalarType.REAL64, rank=arg_type.rank)
+                return ScalarType.REAL64
             if isinstance(expr.func, ast.Name) and expr.func.id == "ac_shape":
                 return self._shape_record_type(expr.args[0] if expr.args else None)
             if isinstance(expr.func, ast.Name) and expr.func.id == "ac_shape_dim":
                 return ScalarType.INTEGER
+            if isinstance(expr.func, ast.Name) and expr.func.id in {"ac_dnorm", "ac_dnorm_log"}:
+                if expr.args:
+                    arg_type = self._infer_type(expr.args[0])
+                    if isinstance(arg_type, ArrayTypeRef):
+                        return arg_type
+                return ScalarType.REAL64
+            if isinstance(expr.func, ast.Name) and expr.func.id == "ac_quantile":
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
             if isinstance(expr.func, ast.Name) and expr.func.id in {"min", "max", "minval", "maxval"} and expr.args:
                 arg_types = [self._infer_type(arg) for arg in expr.args]
                 if all(arg_type == ScalarType.INTEGER for arg_type in arg_types):
@@ -2576,6 +2716,8 @@ class PythonNumpyFrontend:
             if chain == ["np", "clip"]:
                 arg_type = self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
                 return arg_type
+            if chain == ["np", "real"]:
+                return self._infer_type(expr.args[0]) if expr.args else ScalarType.REAL64
             if isinstance(expr.func, ast.Attribute) and self._is_strip_lower_chain(expr.func):
                 return ScalarType.STRING
             if isinstance(expr.func, ast.Attribute) and expr.func.attr == "strip":
@@ -2877,13 +3019,17 @@ class PythonNumpyFrontend:
                     return ArrayTypeRef(element_type)
                 if chain == ["np", "where"]:
                     if len(expr.args) == 3:
+                        cond_type = self._infer_type(expr.args[0])
                         true_type = self._infer_type(expr.args[1])
                         false_type = self._infer_type(expr.args[2])
+                        rank = cond_type.rank if isinstance(cond_type, ArrayTypeRef) else 1
                         if isinstance(true_type, ArrayTypeRef):
                             return true_type
                         if isinstance(false_type, ArrayTypeRef):
                             return false_type
-                        return true_type
+                        if true_type == ScalarType.INTEGER and false_type == ScalarType.INTEGER:
+                            return ArrayTypeRef(ScalarType.INTEGER, rank=rank)
+                        return ArrayTypeRef(ScalarType.REAL64, rank=rank)
                     return ArrayTypeRef(ScalarType.INTEGER)
                 if chain == ["np", "empty"] or chain == ["np", "full"]:
                     element_type = self._infer_numpy_array_element_type(expr)
@@ -3115,6 +3261,22 @@ class PythonNumpyFrontend:
         if isinstance(current, ast.Name):
             parts.append(current.id)
         return list(reversed(parts))
+
+    def _shape_base_name(self, node: ast.Attribute) -> str | None:
+        if node.attr != "shape":
+            return None
+        base = node.value
+        if isinstance(base, ast.Name):
+            return base.id
+        if (
+            isinstance(base, ast.Call)
+            and isinstance(base.func, ast.Attribute)
+            and self._attr_chain(base.func) == ["np", "asarray"]
+            and len(base.args) == 1
+            and isinstance(base.args[0], ast.Name)
+        ):
+            return base.args[0].id
+        return None
 
     def _infer_array_rank(self, expr: ast.AST) -> int:
         if isinstance(expr, ast.List):
@@ -3559,11 +3721,24 @@ class PythonNumpyFrontend:
             if isinstance(row_spec, ast.Constant) and row_spec.value is None:
                 if isinstance(col_spec, ast.Slice) and col_spec.lower is None and col_spec.upper is None and col_spec.step is None:
                     return Call("ac_row_axis", (Call("ac_asarray", (self._lower_expr(expr.value),)),))
+            if (
+                isinstance(col_spec, ast.Slice)
+                and col_spec.lower is None
+                and col_spec.upper is None
+                and col_spec.step is None
+                and not isinstance(row_spec, ast.Slice)
+            ):
+                row_index = self._lower_index_expr(row_spec)
+                if isinstance(self._infer_type(row_spec), ArrayTypeRef):
+                    return Call("ac_take_rows", (self._lower_expr(expr.value), row_index))
+                return Call("ac_row", (self._lower_expr(expr.value), row_index))
             if isinstance(row_spec, ast.Slice) and row_spec.lower is None and row_spec.upper is None and row_spec.step is None:
                 if isinstance(col_spec, ast.Constant) and col_spec.value is None:
                     return Call("ac_add_axis", (Call("ac_asarray", (self._lower_expr(expr.value),)),))
                 if isinstance(col_spec, ast.Name) or isinstance(col_spec, ast.Constant):
                     return Call("ac_column", (self._lower_expr(expr.value), self._lower_expr(col_spec)))
+                if isinstance(self._infer_type(col_spec), ArrayTypeRef):
+                    return Call("r_take_cols", (self._lower_expr(expr.value), self._lower_index_expr(col_spec)))
             if (
                 isinstance(row_spec, ast.Slice)
                 and row_spec.lower is None
@@ -3599,6 +3774,15 @@ class PythonNumpyFrontend:
                 and (isinstance(col_spec, ast.Name) or isinstance(col_spec, ast.Constant))
             ):
                 return ExprStatement(Call("ac_set_column", (self._lower_expr(target.value), self._lower_expr(col_spec), value)))
+            if (
+                isinstance(col_spec, ast.Slice)
+                and col_spec.lower is None
+                and col_spec.upper is None
+                and col_spec.step is None
+                and not isinstance(row_spec, ast.Slice)
+            ):
+                func_name = "ac_set_rows" if isinstance(self._infer_type(row_spec), ArrayTypeRef) else "ac_set_row"
+                return ExprStatement(Call(func_name, (self._lower_expr(target.value), self._lower_index_expr(row_spec), value)))
         return None
 
     def _infer_slice_type(self, expr: ast.Subscript) -> object | None:

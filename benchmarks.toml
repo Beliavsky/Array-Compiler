@@ -1,0 +1,29 @@
+[[benchmark]]
+name = "xoptions_pde"
+path = "xoptions_pde.py"
+repeats = 5
+warmups = 1
+baseline_fortran_seconds = 0.21
+min_source_seconds_for_source_ratio = 1.0
+warn_if_fortran_slower_than_source = 1.5
+fail_if_fortran_slower_than_source = 2.5
+warn_if_fortran_slower_by_seconds = 5.0
+fail_if_fortran_slower_by_seconds = 15.0
+warn_if_fortran_slower_than_baseline = 1.15
+fail_if_fortran_slower_than_baseline = 1.50
+tags = ["python", "pde", "performance"]
+
+[[benchmark]]
+name = "xfit_mix"
+path = "xfit_mix.r"
+repeats = 5
+warmups = 1
+baseline_fortran_seconds = 0.11
+min_source_seconds_for_source_ratio = 1.0
+warn_if_fortran_slower_than_source = 1.5
+fail_if_fortran_slower_than_source = 2.5
+warn_if_fortran_slower_by_seconds = 5.0
+fail_if_fortran_slower_by_seconds = 15.0
+warn_if_fortran_slower_than_baseline = 1.20
+fail_if_fortran_slower_than_baseline = 1.60
+tags = ["r", "mixture", "performance"]

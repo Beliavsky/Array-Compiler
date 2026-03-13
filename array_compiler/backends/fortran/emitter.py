@@ -167,6 +167,12 @@ AC_NUMPY_FUNCS = {
     "ac_slice2",
 }
 
+AC_STATS_FUNCS = {
+    "ac_dnorm",
+    "ac_dnorm_log",
+    "ac_quantile",
+}
+
 AC_LAPACK_FUNCS = {
     "ac_eig",
     "ac_svd",
@@ -205,7 +211,7 @@ class FortranBackend:
             "",
         ]
         lines.extend(self._emit_visibility_lines(module, export_names))
-        for record in module.records:
+        for record in self._sorted_records(module.records):
             lines.extend(self._emit_record(record))
             lines.append("")
         lines.extend([
@@ -227,6 +233,8 @@ class FortranBackend:
         lines: list[str] = ["use kind_mod, only: dp"]
         if "ac_constants" in helper_keys:
             lines.append("use ac_constants_mod, only: ac_pi, ac_e")
+        if "ac_stats" in helper_keys:
+            lines.append("use ac_stats_mod, only: ac_dnorm, ac_dnorm_log, ac_quantile")
         if "ac_string" in helper_keys:
             lines.append(
                 "use ac_string_mod, only: ac_lower, ac_format_default, ac_format_fixed, &"
@@ -282,9 +290,31 @@ class FortranBackend:
         lines.append(f"end type {record.name}")
         return lines
 
+    def _sorted_records(self, records: list[object]) -> list[object]:
+        record_map = {record.name: record for record in records}
+        ordered: list[object] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(record_name: str) -> None:
+            if record_name in visited or record_name in visiting:
+                return
+            visiting.add(record_name)
+            record = record_map[record_name]
+            for _, field_type in record.fields:
+                if isinstance(field_type, RecordTypeRef) and field_type.name in record_map:
+                    visit(field_type.name)
+            visiting.remove(record_name)
+            visited.add(record_name)
+            ordered.append(record)
+
+        for record in records:
+            visit(record.name)
+        return ordered
+
     def _emit_function(self, fn: Function) -> list[str]:
         attrs = self._procedure_attrs(fn)
-        parameter_values, local_values, body = self._extract_local_parameters(fn.locals, fn.body)
+        parameter_values, parameter_comments, local_values, body = self._extract_local_parameters(fn.locals, fn.body)
         body, removable_locals = self._rewrite_body(body, {name for name, _ in local_values})
         local_values = self._prune_unused_locals(local_values, body, removable_locals)
         previous_symbols = self._current_symbols
@@ -306,6 +336,7 @@ class FortranBackend:
             lines = [f"{prefix}subroutine {fn.name}({arg_text})"]
             lines.extend(f"! {comment}" for comment in fn.leading_comments)
             lines.extend(self._declare_args(emitted_args))
+            lines.extend(f"! {comment}" for comment in parameter_comments)
             lines.extend(self._declare_parameters(parameter_values))
             lines.extend(self._declare_locals(local_values))
             body = self._trim_terminal_return(body, "")
@@ -338,6 +369,7 @@ class FortranBackend:
         lines.extend(f"! {comment}" for comment in fn.leading_comments)
         lines.extend(self._declare_args(emitted_args))
         lines.append(self._declare_result(result_name, fn.result_type))
+        lines.extend(f"! {comment}" for comment in parameter_comments)
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
         lines.extend(self._emit_body(body, result_name))
@@ -348,7 +380,7 @@ class FortranBackend:
         return lines
 
     def _emit_program(self, program) -> list[str]:
-        parameter_values, local_values, body = self._extract_local_parameters(
+        parameter_values, parameter_comments, local_values, body = self._extract_local_parameters(
             getattr(program, "locals", []),
             program.body,
         )
@@ -358,6 +390,7 @@ class FortranBackend:
         self._current_symbols = {name: typ for name, typ in getattr(program, "locals", [])}
         lines = [f"subroutine {program.name}()"]
         lines.extend(f"! {comment}" for comment in getattr(program, "leading_comments", []))
+        lines.extend(f"! {comment}" for comment in parameter_comments)
         lines.extend(self._declare_parameters(parameter_values))
         lines.extend(self._declare_locals(local_values))
         lines.extend(self._emit_body(body, result_name=""))
@@ -454,9 +487,7 @@ class FortranBackend:
         if isinstance(stmt, Append):
             return [f"{stmt.target.name} = [{stmt.target.name}, {self._emit_expr(stmt.value)}]"]
         if isinstance(stmt, IndexAssignment):
-            index_text = self._emit_index_selector(stmt.index)
-            if index_text is None:
-                index_text = self._emit_plus_one(stmt.index)
+            index_text = self._emit_one_based_index(stmt.target, stmt.index)
             return [f"{self._emit_expr(stmt.target)}({index_text}) = {self._emit_expr(stmt.value)}"]
         if isinstance(stmt, FieldAssignment):
             return [f"{self._emit_expr(stmt.target)}%{stmt.field} = {self._emit_expr(stmt.value)}"]
@@ -571,9 +602,7 @@ class FortranBackend:
         if isinstance(expr, FieldAccess):
             return f"{self._emit_expr(expr.value)}%{expr.field}"
         if isinstance(expr, IndexAccess):
-            index_text = self._emit_index_selector(expr.index)
-            if index_text is None:
-                index_text = self._emit_plus_one(expr.index)
+            index_text = self._emit_one_based_index(expr.value, expr.index)
             base_text = self._emit_expr(expr.value)
             if isinstance(expr.value, Call) and expr.value.func == "ac_array_literal":
                 base_text = f"({base_text})"
@@ -979,6 +1008,29 @@ class FortranBackend:
         simplified = self._simplify_expr(BinaryOp(expr, BinaryOperator.ADD, Constant(1)))
         return self._emit_expr(simplified)
 
+    def _emit_one_based_index(self, base_expr: object, index_expr: object) -> str:
+        negative_text = self._emit_negative_index(base_expr, index_expr)
+        if negative_text is not None:
+            return negative_text
+        index_text = self._emit_index_selector(index_expr)
+        if index_text is None:
+            return self._emit_plus_one(index_expr)
+        return index_text
+
+    def _emit_negative_index(self, base_expr: object, index_expr: object) -> str | None:
+        base_text = self._emit_expr(base_expr)
+        if isinstance(index_expr, UnaryOp) and index_expr.op == UnaryOperator.MINUS:
+            offset_text = self._emit_expr(index_expr.operand)
+            if offset_text == "1":
+                return f"size({base_text})"
+            return f"(size({base_text}) - {offset_text} + 1)"
+        if isinstance(index_expr, Constant) and isinstance(index_expr.value, int) and index_expr.value < 0:
+            offset = -index_expr.value
+            if offset == 1:
+                return f"size({base_text})"
+            return f"(size({base_text}) - {offset} + 1)"
+        return None
+
     def _simplify_expr(self, expr: object) -> object:
         if isinstance(expr, BinaryOp):
             left = self._simplify_expr(expr.left)
@@ -1186,11 +1238,13 @@ class FortranBackend:
         self,
         locals_list: list[tuple[str, object]],
         body: list[object],
-    ) -> tuple[list[tuple[str, object, object]], list[tuple[str, object]], list[object]]:
+    ) -> tuple[list[tuple[str, object, object]], list[str], list[tuple[str, object]], list[object]]:
         local_types = {name: value_type for name, value_type in locals_list}
         parameter_names: set[str] = set()
         parameter_values: dict[str, object] = {}
         parameter_assignment_indexes: set[int] = set()
+        parameter_comment_indexes: set[int] = set()
+        parameter_comments: list[str] = []
         for index, stmt in enumerate(body):
             if not isinstance(stmt, Assignment):
                 continue
@@ -1204,8 +1258,15 @@ class FortranBackend:
                 parameter_names.add(name)
                 parameter_values[name] = stmt.value
                 parameter_assignment_indexes.add(index)
+                start = index
+                while start > 0 and isinstance(body[start - 1], Comment):
+                    start -= 1
+                for comment_index in range(start, index):
+                    if comment_index not in parameter_comment_indexes and isinstance(body[comment_index], Comment):
+                        parameter_comment_indexes.add(comment_index)
+                        parameter_comments.append(body[comment_index].text)
         if not parameter_names:
-            return [], locals_list, body
+            return [], [], locals_list, body
 
         parameters = [
             (name, value_type, parameter_values[name])
@@ -1219,9 +1280,9 @@ class FortranBackend:
         ]
         filtered_body = [
             stmt for index, stmt in enumerate(body)
-            if index not in parameter_assignment_indexes
+            if index not in parameter_assignment_indexes and index not in parameter_comment_indexes
         ]
-        return parameters, filtered_locals, filtered_body
+        return parameters, parameter_comments, filtered_locals, filtered_body
 
     def _count_name_writes(self, body: list[object], name: str) -> int:
         count = 0
@@ -1583,6 +1644,8 @@ class FortranBackend:
             if use_index is None:
                 continue
             name = stmt.target.name
+            if self._stmt_has_field_access(body[use_index], name):
+                continue
             if self._stmt_read_count(body[use_index], name) != 1:
                 continue
             if any(self._stmt_read_count(other, name) or self._stmt_write_count(other, name) for other in body[use_index + 1:]):
@@ -1593,6 +1656,58 @@ class FortranBackend:
             new_body.extend(body[use_index + 1:])
             return new_body, name
         return None
+
+    def _stmt_has_field_access(self, stmt: object, name: str) -> bool:
+        if isinstance(stmt, Assignment):
+            return self._expr_has_field_access(stmt.value, name)
+        if isinstance(stmt, IndexAssignment):
+            return (
+                self._expr_has_field_access(stmt.target, name)
+                or self._expr_has_field_access(stmt.index, name)
+                or self._expr_has_field_access(stmt.value, name)
+            )
+        if isinstance(stmt, ExprStatement):
+            return self._expr_has_field_access(stmt.expr, name)
+        if isinstance(stmt, Return):
+            return stmt.value is not None and self._expr_has_field_access(stmt.value, name)
+        if isinstance(stmt, Print):
+            return any(self._expr_has_field_access(value, name) for value in stmt.values)
+        if isinstance(stmt, If):
+            return (
+                self._expr_has_field_access(stmt.test, name)
+                or any(self._stmt_has_field_access(inner, name) for inner in stmt.body)
+                or any(self._stmt_has_field_access(inner, name) for inner in stmt.orelse)
+            )
+        if isinstance(stmt, ForRange):
+            return (
+                (stmt.start is not None and self._expr_has_field_access(stmt.start, name))
+                or self._expr_has_field_access(stmt.stop, name)
+                or (stmt.step is not None and self._expr_has_field_access(stmt.step, name))
+                or any(self._stmt_has_field_access(inner, name) for inner in stmt.body)
+            )
+        if isinstance(stmt, While):
+            return self._expr_has_field_access(stmt.test, name) or any(
+                self._stmt_has_field_access(inner, name) for inner in stmt.body
+            )
+        return False
+
+    def _expr_has_field_access(self, expr: object, name: str) -> bool:
+        if isinstance(expr, FieldAccess):
+            if isinstance(expr.value, ValueRef) and expr.value.name == name:
+                return True
+            return self._expr_has_field_access(expr.value, name)
+        if isinstance(expr, ValueRef):
+            return False
+        if hasattr(expr, "__dataclass_fields__"):
+            return any(
+                self._expr_has_field_access(getattr(expr, field_name), name)
+                for field_name in expr.__dataclass_fields__
+            )
+        if isinstance(expr, tuple):
+            return any(self._expr_has_field_access(item, name) for item in expr)
+        if isinstance(expr, list):
+            return any(self._expr_has_field_access(item, name) for item in expr)
+        return False
 
     def _next_real_stmt_index(self, body: list[object], start: int) -> int | None:
         for index in range(start, len(body)):
@@ -1629,6 +1744,8 @@ class FortranBackend:
                 "ac_loadtxt_1d",
                 "ac_savetxt",
                 "ac_fill_slice",
+                "ac_cholesky",
+                "ac_inv",
             }:
                 return False
             return all(self._expr_is_safe_to_inline(arg) for arg in expr.args)
@@ -2228,6 +2345,14 @@ class FortranBackend:
     def _assigned_names_in_stmt(self, stmt: object) -> set[str]:
         if isinstance(stmt, Assignment):
             return {stmt.target.name}
+        if isinstance(stmt, IndexAssignment):
+            if isinstance(stmt.target, ValueRef):
+                return {stmt.target.name}
+            return set()
+        if isinstance(stmt, FieldAssignment):
+            if isinstance(stmt.target, ValueRef):
+                return {stmt.target.name}
+            return set()
         if isinstance(stmt, AugmentedAssignment):
             return {stmt.target.name}
         if isinstance(stmt, If):
@@ -2324,11 +2449,14 @@ class FortranBackend:
                 "ac_loadtxt",
                 "ac_loadtxt_1d",
                 "ac_savetxt",
+                "ac_cov_rowvar_false",
                 "ac_fill_slice",
                 "ac_slogdet_sign",
                 "ac_slogdet_logabsdet",
                 "ac_inv",
                 "ac_cholesky",
+                "ac_eig",
+                "ac_svd",
                 "ac_format_default",
                 "ac_format_fixed",
                 "ac_format_scientific",
@@ -2363,6 +2491,8 @@ class FortranBackend:
                 helper_keys.add("ac_string")
             elif isinstance(value, Call) and value.func in {"ac_random_init", "ac_gauss"}:
                 helper_keys.add("ac_random")
+            elif isinstance(value, Call) and value.func in AC_STATS_FUNCS:
+                helper_keys.add("ac_stats")
             elif isinstance(value, Call) and (value.func == "ac_wall_time" or value.func in AC_NUMPY_FUNCS):
                 helper_keys.add("ac_numpy")
             elif isinstance(value, Call) and value.func in AC_LAPACK_FUNCS:
@@ -2545,6 +2675,27 @@ class FortranBackend:
                 return ScalarType.INTEGER
             if expr.func in {"ac_any", "ac_file_exists"}:
                 return ScalarType.LOGICAL
+            if expr.func == "ac_where_select":
+                cond_type = self._expr_type(expr.args[0]) if expr.args else ArrayTypeRef(ScalarType.LOGICAL)
+                true_type = self._expr_type(expr.args[1]) if len(expr.args) > 1 else ScalarType.REAL64
+                false_type = self._expr_type(expr.args[2]) if len(expr.args) > 2 else ScalarType.REAL64
+                rank = cond_type.rank if isinstance(cond_type, ArrayTypeRef) else 1
+                if isinstance(true_type, ArrayTypeRef):
+                    return true_type
+                if isinstance(false_type, ArrayTypeRef):
+                    return false_type
+                if true_type == ScalarType.INTEGER and false_type == ScalarType.INTEGER:
+                    return ArrayTypeRef(ScalarType.INTEGER, rank=rank)
+                return ArrayTypeRef(ScalarType.REAL64, rank=rank)
+            if expr.func == "ac_quantile":
+                return ArrayTypeRef(ScalarType.REAL64, rank=1)
+            if expr.func in AC_STATS_FUNCS:
+                first = expr.args[0] if expr.args else None
+                if first is not None:
+                    first_type = self._expr_type(first)
+                    if isinstance(first_type, ArrayTypeRef):
+                        return first_type
+                return ScalarType.REAL64
             if expr.func in {"float", "ac_float", "ac_parse_real", "abs", "min", "max", "minval", "maxval", "sum", "sin", "cos", "sqrt", "exp", "log", "ac_norm", "ac_var", "ac_std"}:
                 first_type = self._expr_type(expr.args[0]) if expr.args else None
                 if isinstance(first_type, ArrayTypeRef) and expr.func in {"abs", "sqrt", "exp", "log"}:
