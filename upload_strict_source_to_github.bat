@@ -19,7 +19,7 @@ if errorlevel 1 (
 set "MESSAGE=%~1"
 set "REMOTE=%~2"
 if "%MESSAGE%"=="" (
-    set "MESSAGE=Update core Array-Compiler source files"
+    set "MESSAGE=Update core compiler/runtime sources, benchmark tooling, R/Python translation paths, and README"
 )
 if "%REMOTE%"=="" set "REMOTE=origin"
 
@@ -30,6 +30,7 @@ if errorlevel 1 exit /b 1
 echo Staging strict source whitelist...
 for %%F in (
     ".gitignore"
+    "README.md"
     "pyproject.toml"
     "benchmarks.toml"
     "x2f.py"
@@ -47,7 +48,7 @@ for %%F in (
     if errorlevel 1 exit /b 1
 )
 
-echo Excluded by design: tests/, example programs, docs/, scripts/, README.md, generated files, outputs, and temp files.
+echo Excluded by design: tests/, example programs, docs/, scripts/, generated files, outputs, and temp files.
 
 echo Staged files:
 git diff --cached --name-only
